@@ -1,7 +1,7 @@
 {
   "name": "skyline-mod-claude",
-  "version": "0.1.0",
-  "description": "EARLY ACCESS prototype of skyline as a Claude Code mod (function hooks). Stage 1: a tool.call hook on Read lets the engine's Read run, records the shape of what comes back (keys and types, never file contents), and returns the result untouched. The recorded shape is what stage 2 needs to answer Read from the skyline daemon itself instead of denying and redirecting. Written against Claude Code 2.1.278 with CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1; the mod API may change between releases.",
+  "version": "0.2.0",
+  "description": "EARLY ACCESS: skyline as a Claude Code mod (function hooks). One tool.call hook on Read answers a Read of a text file inside a code tree from the skyline daemon itself, in the record core produces, so the model's native Read succeeds at once instead of being denied and redirected by the classic enforce hook. Files outside any code tree, under ~/.claude, pdfs, images, notebooks, pages requests, daemon errors and a daemon that is down all fall through to core's Read untouched. Every result's shape is still recorded (keys and types, never contents). Written against Claude Code 2.1.278 with CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1; the mod API may change between releases.",
   "author": {
     "name": "Skylence",
     "url": "https://github.com/skylence-be"
@@ -17,6 +17,27 @@
     "claude-code"
   ],
   "userConfig": {
+    "daemonUrl": {
+      "type": "string",
+      "title": "Skyline daemon URL",
+      "description": "The skyline daemon's MCP endpoint. Empty uses http://127.0.0.1:7333/mcp.",
+      "required": false,
+      "default": ""
+    },
+    "answerFromSkyline": {
+      "type": "boolean",
+      "title": "Answer Read from skyline",
+      "description": "On (default): eligible Reads are answered from the skyline daemon. Off: the mod observes only, as stage 1 did.",
+      "required": false,
+      "default": true
+    },
+    "anchorContext": {
+      "type": "boolean",
+      "title": "Anchor context line",
+      "description": "On (default): skyline's ¶path#TAG anchor rides along as one context line after a Read answered from skyline, so the model can paste it into a skyline edit. Off: the Read is fully transparent.",
+      "required": false,
+      "default": true
+    },
     "shapeFile": {
       "type": "string",
       "title": "Shape file",

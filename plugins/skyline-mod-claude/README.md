@@ -61,8 +61,65 @@ reads (`File does not exist. Note: your current working directory is …`).
 
 A Read a hook refuses resolves `{ deny }` and never reaches the tool.
 
-Stage 2 answers Read from skyline by building `result.file` from the daemon's
-read tool and letting core render `text` from it.
+## Stage 2: answer Read from skyline
+
+The same hook now answers an eligible Read itself. It asks the skyline daemon
+for the file over MCP streamable HTTP (`$.http.fetch`, so the engine owns the
+socket), translates skyline's block into the record above, and returns
+`{ result: { type: 'text', file }, context: [anchor] }`. Core renders the
+model-facing `text` from `result` exactly as it does for its own Read, so the
+model sees the usual numbered lines; core's Read never runs, and the classic
+enforce hook beneath never sees a call to deny. No retry, no redirect.
+
+Eligible means: a text file (not pdf, image, notebook, or a `pages` request),
+resolved against the session directory, not under `~/.claude`, and inside a
+code tree (a `.git` or `.skyrift-workspace` marker in its directory or above,
+the classic hook's rule). Everything else, and every failure, goes on to core
+untouched:
+
+- daemon unreachable: core reads, and the daemon is marked down for 5 s so a
+  batch of Reads does not each wait out a connection timeout;
+- daemon restarted (our session id is stale): one re-initialize, then the Read;
+- skyline reports an error (file missing): core reads and produces the native
+  error the model already knows;
+- skyline's block is not a plain numbered read: core reads.
+
+Skyline is asked with `full: true` (its delta shortcut would otherwise answer a
+repeated read with only the changed lines) and `max_match_chars: 0` (no
+500-character line cap). `offset` and `limit` pass through; both sides are
+1-indexed.
+
+Two differences from core's own Read, both minor:
+
+- `content` is rebuilt from skyline's `N:` lines, so whether the file ended
+  with a newline is lost; core counts that trailing empty segment as a line
+  and the mod does not.
+- `totalLines` is exact on a whole read (skyline's `total:` trailer) and a
+  lower bound on a partial one (the last line returned).
+
+The one place the mod is not transparent: the `¶path#TAG` anchor rides along
+as a context line the model reads (`skyline anchor for edit (paste verbatim):
+¶…#TAG`), so a skyline `edit` can follow without a second read. Set
+`anchorContext` off to drop it.
+
+Options (`pluginConfigs` in user settings or `--settings`): `daemonUrl`,
+`answerFromSkyline` (off makes the mod observe only, as stage 1 did),
+`anchorContext`, `shapeFile`.
+
+### Writing a user-tier mod: what the loader enforces
+
+Anthropic's built-in mods load natively; a plugin's module is checked
+statically before it loads, and the check refused two things on the way here:
+
+- `$` may only be spelled `$.noun.event(...)` at a call site. It cannot be
+  passed to a helper, bound, spread, returned or read. Helpers therefore take
+  closures the hook builds (`fetch: (url, init) => $.http.fetch(url, init)`).
+- `$.env.get` takes a literal variable name, so the variables a module reads
+  can be listed.
+
+The kit also hands a hook the path as the host spells it: a test's
+`$.fs.exists('/repo/.git')` reaches the hook beneath as `C:\repo\.git` on
+Windows, so a mock must compare separator-agnostically.
 
 ## Test and typecheck
 

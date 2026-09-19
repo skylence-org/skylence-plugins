@@ -101,8 +101,10 @@ available in a fresh Claude Code session.
 - `skycastle-claude` — skycastle secrets MCP + CLI steering + status command +
   operate skill.
 - `skyline-mod-claude` — EARLY ACCESS, not in the marketplace yet. Skyline as a
-  Claude Code mod (function hooks, `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`).
-  Stage 1 wraps Read and records the result shape; run from source with
+  Claude Code mod (function hooks, `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`): a
+  Read inside a code tree is answered from the skyline daemon in the native
+  Read shape, so the model is never denied and never retries. Needs the daemon
+  on port 7333; run from source with
   `claude --plugin-dir plugins/skyline-mod-claude`, test with
   `claude plugin test plugins/skyline-mod-claude`.
 
