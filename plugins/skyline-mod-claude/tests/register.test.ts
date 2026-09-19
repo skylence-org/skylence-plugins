@@ -40,8 +40,13 @@ type Daemon = {
  * ~/.claude reads, a clock, core's Read, and a skyline daemon over http.fetch
  * that speaks MCP streamable HTTP as the real one does.
  */
-function worldOf(on: On, options: { down?: boolean; codeTree?: boolean; cwd?: string } = {}) {
+function worldOf(on: On, options: { down?: boolean; codeTree?: boolean; cwd?: string; decision?: 'allow' | 'ask' | 'deny' } = {}) {
   const cwd = options.cwd ?? '/repo'
+  const checked: Record<string, unknown>[] = []
+  on('tool.check', ($, e) => {
+    checked.push(e.input as Record<string, unknown>)
+    return { decision: options.decision ?? 'allow', ...(options.decision === 'deny' ? { reason: 'Read(./sample.txt) is denied' } : {}) }
+  })
   const daemon: Daemon = {
     sent: [],
     sessions: [],
@@ -91,7 +96,7 @@ function worldOf(on: On, options: { down?: boolean; codeTree?: boolean; cwd?: st
     return answer(r.status ?? 200, { 'content-type': 'text/event-stream' }, r.text.replace('"id":0,', `"id":${body.id},`))
   })
 
-  return { daemon, coreReads, transcript, debug, clock, asked }
+  return { daemon, coreReads, transcript, debug, clock, asked, checked }
 }
 
 describe('register', () => {
@@ -101,6 +106,7 @@ describe('register', () => {
     const got = await $.tool.call({ tool: 'Read', file_path: 'sample.txt' })
 
     expect(world.asked).toEqual(['/repo/.git'])
+    expect(world.checked).toEqual([{ file_path: '/repo/sample.txt' }])
     expect(got).toEqual({
       result: {
         type: 'text',
@@ -203,6 +209,18 @@ describe('register', () => {
 
     expect(world.coreReads).toHaveLength(4)
     expect(world.daemon.sent).toEqual([])
+  })
+
+  test('a Read the permission path would refuse or ask about is left to core, unread by skyline', async ($, on) => {
+    const denied = worldOf(on, { decision: 'deny' })
+
+    const got = await $.tool.call({ tool: 'Read', file_path: '/repo/sample.txt', offset: 2, limit: 1 })
+
+    expect(got).toEqual(CORE_ANSWER)
+    expect(denied.coreReads).toEqual(['/repo/sample.txt'])
+    expect(denied.daemon.sent).toEqual([])
+    expect(denied.checked).toEqual([{ file_path: '/repo/sample.txt', offset: 2, limit: 1 }])
+    expect(denied.debug[0]).toContain('permission deny (Read(./sample.txt) is denied)')
   })
 
   test('another tool is not touched', async ($, on) => {

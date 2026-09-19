@@ -72,10 +72,14 @@ model sees the usual numbered lines; core's Read never runs, and the classic
 enforce hook beneath never sees a call to deny. No retry, no redirect.
 
 Eligible means: a text file (not pdf, image, notebook, or a `pages` request),
-resolved against the session directory, not under `~/.claude`, and inside a
-code tree (a `.git` or `.skyrift-workspace` marker in its directory or above,
-the classic hook's rule). Everything else, and every failure, goes on to core
-untouched:
+resolved against the session directory, not under `~/.claude`, inside a code
+tree (a `.git` or `.skyrift-workspace` marker in its directory or above, the
+classic hook's rule), and one the engine's permission decision allows. That
+last check matters: a hook that answers without `next(e)` skips core's
+permission path, and the first live run with a `Read(./sample.txt)` deny rule
+read the file anyway. The mod now asks `$.tool.check` first and leaves
+anything but `allow` to core, which then refuses as it always did. Everything
+else, and every failure, goes on to core untouched:
 
 - daemon unreachable: core reads, and the daemon is marked down for 5 s so a
   batch of Reads does not each wait out a connection timeout;

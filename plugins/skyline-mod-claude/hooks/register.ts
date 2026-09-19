@@ -52,6 +52,8 @@ type Io = Transport & {
   /** USERPROFILE, else HOME (the loader wants `$.env.get` given literal names). */
   home: () => Promise<string | undefined>
   exists: (path: string) => Promise<boolean>
+  /** The engine's permission decision for this Read, as `$.tool.check` gives it. */
+  check: (input: Record<string, unknown>) => Promise<{ decision: string; reason?: string }>
   debug: (text: string) => void
 }
 
@@ -97,6 +99,7 @@ export function register(on: On, options: PluginOptions): void {
       cwd: () => $.session.cwd(),
       home: async () => (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME')),
       exists: (path) => $.fs.exists(path),
+      check: (input) => $.tool.check({ tool: 'Read', input }),
       debug: (text) => $.ui.log(text, { to: 'debug' }),
     }
 
@@ -146,6 +149,16 @@ async function answerFromSkyline(
     const abs = absoluteOf(e.file_path, await io.cwd())
     if (await isUnderClaudeConfig(io, abs)) return leftToCore(io, abs, 'under ~/.claude')
     if (!(await isInsideCodeTree(io, abs, codeTrees))) return leftToCore(io, abs, 'not inside a code tree')
+
+    // Answering without next() skips core's permission path, so ask it here:
+    // a deny rule, or anything that would need a dialog, is core's to settle.
+    const input: Record<string, unknown> = { file_path: abs }
+    if (e.offset !== undefined) input.offset = e.offset
+    if (e.limit !== undefined) input.limit = e.limit
+    const verdict = await io.check(input)
+    if (verdict.decision !== 'allow') {
+      return leftToCore(io, abs, `permission ${verdict.decision}${verdict.reason ? ` (${verdict.reason})` : ''}`)
+    }
 
     const args: Record<string, unknown> = { path: abs, full: true, max_match_chars: 0 }
     if (e.offset !== undefined) args.offset = e.offset
