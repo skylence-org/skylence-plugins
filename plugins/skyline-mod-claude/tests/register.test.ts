@@ -121,6 +121,7 @@ describe('register', () => {
 
     expect(world.asked).toEqual(['/repo/.git'])
     expect(world.checked).toEqual([{ file_path: '/repo/sample.txt' }])
+    // anchorContext is off by default (0.4.2): no context line, the Read is transparent
     expect(got).toEqual({
       result: {
         type: 'text',
@@ -132,7 +133,6 @@ describe('register', () => {
           totalLines: 3,
         },
       },
-      context: ['skyline anchor for edit (paste verbatim): ¶/repo/sample.txt#E213'],
     })
     expect(world.coreReads).toEqual([])
     expect(world.daemon.sent.map((s) => s.method)).toEqual(['initialize', 'notifications/initialized', 'tools/call'])

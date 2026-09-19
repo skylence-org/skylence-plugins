@@ -1,6 +1,6 @@
 {
   "name": "skyline-mod-claude",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "EARLY ACCESS: skyline as a Claude Code mod (function hooks). tool.call hooks on Read, Grep and Glob answer them from the skyline daemon itself, in the record core produces, so the model's native call succeeds at once instead of being denied and redirected by the classic enforce hook. Read: a text file inside a code tree. Grep: files or content mode under a code tree (count mode, a file type filter and multiline stay core's). Glob: any pattern under a code tree, via skyline's find. Paths outside any code tree or under ~/.claude, pdfs, images, notebooks, pages requests, permission decisions other than allow, daemon errors and a daemon that is down all fall through to core untouched. Every result's shape is still recorded (keys and types, never contents). Written against Claude Code 2.1.278 with CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1; the mod API may change between releases.",
   "author": {
     "name": "Skylence",
@@ -34,9 +34,9 @@
     "anchorContext": {
       "type": "boolean",
       "title": "Anchor context line",
-      "description": "On (default): skyline's ¶path#TAG anchor rides along as one context line after a Read answered from skyline, so the model can paste it into a skyline edit. Off: the Read is fully transparent.",
+      "description": "Off (default): a Read answered from skyline is fully transparent to the model. On: skyline's ¶path#TAG anchor rides along as one context line after the Read, so the model can paste it into a skyline edit; useful only when skyline's edit tool is available to the model and an edit usually follows a read.",
       "required": false,
-      "default": true
+      "default": false
     },
     "shapeFile": {
       "type": "string",

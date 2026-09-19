@@ -101,10 +101,12 @@ Two differences from core's own Read, both minor:
 - `totalLines` is exact on a whole read (skyline's `total:` trailer) and a
   lower bound on a partial one (the last line returned).
 
-The one place the mod is not transparent: the `¶path#TAG` anchor rides along
-as a context line the model reads (`skyline anchor for edit (paste verbatim):
-¶…#TAG`), so a skyline `edit` can follow without a second read. Set
-`anchorContext` off to drop it.
+With `anchorContext` on, the `¶path#TAG` anchor rides along as a context line
+the model reads (`skyline anchor for edit (paste verbatim): ¶…#TAG`), so a
+skyline `edit` can follow without a second read. It is off by default since
+0.4.2: an interactive tester judged it noise whenever no edit followed, and it
+only pays when skyline's edit tool is available to the model. With it off a
+Read answered from skyline is fully transparent.
 
 Options (`pluginConfigs` in user settings or `--settings`): `daemonUrl`,
 `answerFromSkyline` (off makes the mod observe only, as stage 1 did),

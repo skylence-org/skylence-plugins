@@ -120,7 +120,7 @@ type GlobAnswer = { result: GlobRecord }
  * @param on the engine's registrar
  * @param options `daemonUrl` (default http://127.0.0.1:7333/mcp);
  *   `answerFromSkyline` (default true; false makes the mod observe only);
- *   `anchorContext` (default true; false drops the anchor line after a Read);
+ *   `anchorContext` (default false; true adds the anchor line after a Read);
  *   `shapeFile` (default none)
  */
 export function register(on: On, options: PluginOptions): void {
@@ -128,7 +128,7 @@ export function register(on: On, options: PluginOptions): void {
   const daemonUrl =
     typeof options.daemonUrl === 'string' && options.daemonUrl.trim() ? options.daemonUrl.trim() : DEFAULT_DAEMON_URL
   const answering = flag(options.answerFromSkyline, true)
-  const anchorContext = flag(options.anchorContext, true)
+  const anchorContext = flag(options.anchorContext, false)
   const client = new SkylineClient(daemonUrl)
   const codeTrees = new Map<string, boolean>()
   const seen = new Map<string, ReadShape>()
