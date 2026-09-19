@@ -1,0 +1,28 @@
+{
+  "name": "skyline-mod-claude",
+  "version": "0.1.0",
+  "description": "EARLY ACCESS prototype of skyline as a Claude Code mod (function hooks). Stage 1: a tool.call hook on Read lets the engine's Read run, records the shape of what comes back (keys and types, never file contents), and returns the result untouched. The recorded shape is what stage 2 needs to answer Read from the skyline daemon itself instead of denying and redirecting. Written against Claude Code 2.1.278 with CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1; the mod API may change between releases.",
+  "author": {
+    "name": "Skylence",
+    "url": "https://github.com/skylence-be"
+  },
+  "homepage": "https://github.com/skylence-be/skylence-plugins",
+  "repository": "https://github.com/skylence-be/skylence-plugins",
+  "license": "MIT",
+  "keywords": [
+    "skylence",
+    "skyline",
+    "mod",
+    "function-hooks",
+    "claude-code"
+  ],
+  "userConfig": {
+    "shapeFile": {
+      "type": "string",
+      "title": "Shape file",
+      "description": "Optional path (absolute, or relative to the working directory) where the deduplicated Read result shapes are written as JSON after every Read. Empty (the default) writes no file; shapes still go to the debug log, and each new shape is announced once in the transcript.",
+      "required": false,
+      "default": ""
+    }
+  }
+}

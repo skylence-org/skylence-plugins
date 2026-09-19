@@ -1,0 +1,4 @@
+{
+  "description": "Stage 1 of the skyline mod: one tool.call hook on Read awaits next(e), records the shape of the result envelope (top-level keys, the typed record's key/type tree, text length; never file contents), deduplicates by shape, announces each new shape once in the transcript, sends every record to the debug log, optionally rewrites a JSON shape file named by the shapeFile option, and returns the result exactly as it came. A denied or errored Read is recorded under its own kind and returned untouched.",
+  "modules": ["./register.ts"]
+}
