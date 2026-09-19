@@ -73,6 +73,7 @@ function worldOf(on: On, options: { down?: boolean; codeTree?: boolean; cwd?: st
   on('tool.call', ($, e) => {
     if (e.tool === 'Read') coreReads.push(e.file_path)
     if (e.tool === 'Grep') coreReads.push(`grep:${e.pattern}`)
+    if (e.tool === 'Glob') coreReads.push(`glob:${e.pattern}`)
     return CORE_ANSWER
   })
   const answer = (status: number, headers: Record<string, string>, text: string): { value: HttpResponse } => ({
@@ -290,6 +291,46 @@ describe('register', () => {
 
     expect(world.daemon.sent).toEqual([])
     expect(world.debug.filter((l) => l.includes('left to core'))).toHaveLength(2)
+  })
+
+  test('a Glob is answered from skyline find, oldest first, as core would record it', async ($, on) => {
+    const world = worldOf(on)
+    world.daemon.reply = () => ({
+      text: sse({
+        jsonrpc: '2.0',
+        id: 0,
+        result: {
+          content: [{ type: 'text', text: '¶/repo/sub/new.txt#A1\n¶/repo/old.txt#0000\n2 match(es), 2 shown' }],
+          isError: false,
+        },
+      }),
+    })
+
+    const got = await $.tool.call({ tool: 'Glob', pattern: '**/*.txt', path: 'sub/..' })
+
+    expect(got).toMatchObject({
+      result: { filenames: ['old.txt', 'sub/new.txt'], numFiles: 2, totalMatches: 2, truncated: false, countIsComplete: true },
+    })
+    expect(world.coreReads).toEqual([])
+    const call = world.daemon.sent[2]?.params
+    expect(call?.name).toBe('find')
+    expect(call?.arguments).toEqual({ glob: '**/*.txt', path: '/repo/sub/..', cwd: '/repo', files: true, sort: 'mtime', limit: 100 })
+    expect(world.checked).toEqual([{ pattern: '**/*.txt', path: 'sub/..' }])
+    expect(world.transcript[0]).toContain('Glob answered by skyline shape #1')
+  })
+
+  test('a Glob with no matches is an empty record from skyline; outside a code tree it is core\'s', async ($, on) => {
+    const world = worldOf(on)
+    world.daemon.reply = () => ({
+      text: sse({ jsonrpc: '2.0', id: 0, result: { content: [{ type: 'text', text: 'no matches\n0 match(es), 0 shown' }], isError: false } }),
+    })
+
+    const none = await $.tool.call({ tool: 'Glob', pattern: '*.zzz' })
+    const outside = await $.tool.call({ tool: 'Glob', pattern: '*.txt', path: '/elsewhere' })
+
+    expect(none).toMatchObject({ result: { filenames: [], numFiles: 0, totalMatches: 0, truncated: false } })
+    expect(outside).toEqual(CORE_ANSWER)
+    expect(world.coreReads).toEqual(['glob:*.txt'])
   })
 
   test('another tool is not touched', async ($, on) => {

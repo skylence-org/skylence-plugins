@@ -1,7 +1,7 @@
 {
   "name": "skyline-mod-claude",
-  "version": "0.3.0",
-  "description": "EARLY ACCESS: skyline as a Claude Code mod (function hooks). tool.call hooks on Read and Grep answer them from the skyline daemon itself, in the record core produces, so the model's native Read or Grep succeeds at once instead of being denied and redirected by the classic enforce hook. Read: a text file inside a code tree. Grep: files or content mode under a code tree (count mode, a file type filter and multiline stay core's). Paths outside any code tree or under ~/.claude, pdfs, images, notebooks, pages requests, permission decisions other than allow, daemon errors and a daemon that is down all fall through to core untouched. Every result's shape is still recorded (keys and types, never contents). Written against Claude Code 2.1.278 with CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1; the mod API may change between releases.",
+  "version": "0.4.0",
+  "description": "EARLY ACCESS: skyline as a Claude Code mod (function hooks). tool.call hooks on Read, Grep and Glob answer them from the skyline daemon itself, in the record core produces, so the model's native call succeeds at once instead of being denied and redirected by the classic enforce hook. Read: a text file inside a code tree. Grep: files or content mode under a code tree (count mode, a file type filter and multiline stay core's). Glob: any pattern under a code tree, via skyline's find. Paths outside any code tree or under ~/.claude, pdfs, images, notebooks, pages requests, permission decisions other than allow, daemon errors and a daemon that is down all fall through to core untouched. Every result's shape is still recorded (keys and types, never contents). Written against Claude Code 2.1.278 with CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1; the mod API may change between releases.",
   "author": {
     "name": "Skylence",
     "url": "https://github.com/skylence-be"

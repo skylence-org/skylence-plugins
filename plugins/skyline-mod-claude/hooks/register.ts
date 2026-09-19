@@ -1,5 +1,6 @@
 import type { EngineInterface, On, PluginOptions } from 'claude-code'
 
+import { translateGlob, type GlobRecord } from './glob'
 import { translateGrep, type GrepMode, type GrepRecord } from './grep'
 import { DaemonDown, SkylineClient, type Transport } from './mcp'
 import { shapeOf, signatureOf, type Shape } from './shape'
@@ -15,6 +16,9 @@ const CODE_TREE_MARKERS = ['.git', '.skyrift-workspace']
 
 /** Core's default cap on Grep output lines or files. */
 const GREP_DEFAULT_LIMIT = 250
+
+/** Core's cap on Glob results before it reports truncation. */
+const GLOB_LIMIT = 100
 
 /**
  * What a call came back as: answered by the tool, refused by a hook or the
@@ -86,9 +90,13 @@ type GrepCall = {
   multiline?: boolean
 }
 
+type GlobCall = { pattern: string; path?: string }
+
 type ReadAnswer = { result: { type: 'text'; file: ReadFile }; context?: readonly string[] }
 
 type GrepAnswer = { result: GrepRecord }
+
+type GlobAnswer = { result: GlobRecord }
 
 /**
  * Registers the mod's hooks, on Read and on Grep.
@@ -142,6 +150,17 @@ export function register(on: On, options: PluginOptions): void {
     return result
   })
 
+  on('tool.call', { tool: 'Glob' }, async ($, e, next) => {
+    if (e.tool !== 'Glob') return next(e)
+
+    const io = ioOf($, 'Glob')
+    const answered = answering ? await answerGlobFromSkyline(io, e, client, codeTrees) : undefined
+    const result = answered ?? (await next(e))
+
+    await record(recorderOf($), 'Glob', e.pattern, result, answered ? 'skyline' : 'core')
+    return result
+  })
+
   /**
    * Records one result's shape: a transcript notice the first time a shape is
    * seen, a debug line every time, the shape file when one is named. Never
@@ -175,7 +194,7 @@ export function register(on: On, options: PluginOptions): void {
  * declaration: the loader lets a hook pass `$` to one of those and to nothing
  * else (not to a nested function, a method, or a variable).
  */
-function ioOf($: EngineInterface, tool: 'Read' | 'Grep'): Io {
+function ioOf($: EngineInterface, tool: 'Read' | 'Grep' | 'Glob'): Io {
   return {
     fetch: (url, init) => $.http.fetch(url, init),
     now: () => $.clock.now(),
@@ -275,7 +294,7 @@ async function answerGrepFromSkyline(
     const cwd = await io.cwd()
     const searchPath = e.path === undefined ? cwd : absoluteOf(e.path, cwd)
     if (await isUnderClaudeConfig(io, searchPath)) return leftToCore(io, 'Grep', subject, 'under ~/.claude')
-    if (!(await isInsideCodeTree(io, searchPath + (searchPath.endsWith('/') || searchPath.endsWith('\\') ? '' : '/.'), codeTrees))) {
+    if (!(await isInsideCodeTree(io, directoryMarker(searchPath), codeTrees))) {
       return leftToCore(io, 'Grep', subject, 'not inside a code tree')
     }
 
@@ -317,6 +336,58 @@ async function answerGrepFromSkyline(
   } catch (err) {
     return leftToCore(io, 'Grep', subject, err instanceof DaemonDown ? `daemon down: ${err.message}` : messageOf(err))
   }
+}
+
+/**
+ * Answers a Glob from skyline's `find`, or returns undefined to let core's
+ * Glob run. Skyline is asked newest-first (its only sort) and the rows are
+ * turned round, since core lists oldest first.
+ */
+async function answerGlobFromSkyline(
+  io: Io,
+  e: GlobCall,
+  client: SkylineClient,
+  codeTrees: Map<string, boolean>,
+): Promise<GlobAnswer | undefined> {
+  try {
+    if (!e.pattern) return leftToCore(io, 'Glob', e.pattern, 'empty pattern')
+
+    const cwd = await io.cwd()
+    const searchPath = e.path === undefined ? cwd : absoluteOf(e.path, cwd)
+    if (await isUnderClaudeConfig(io, searchPath)) return leftToCore(io, 'Glob', e.pattern, 'under ~/.claude')
+    if (!(await isInsideCodeTree(io, directoryMarker(searchPath), codeTrees))) {
+      return leftToCore(io, 'Glob', e.pattern, 'not inside a code tree')
+    }
+
+    const input: Record<string, unknown> = { pattern: e.pattern }
+    if (e.path !== undefined) input.path = e.path
+    const verdict = await io.check(input)
+    if (verdict.decision !== 'allow') return leftToCore(io, 'Glob', e.pattern, `permission ${verdictText(verdict)}`)
+
+    const started = await io.now()
+    const reply = await client.call(io, 'find', {
+      glob: e.pattern,
+      path: searchPath,
+      cwd,
+      files: true,
+      sort: 'mtime',
+      limit: GLOB_LIMIT,
+    })
+    if (reply.isError) return leftToCore(io, 'Glob', e.pattern, 'skyline reported an error')
+    const durationMs = Math.max(0, (await io.now()) - started)
+
+    const block = firstText(reply.content)
+    const translated = block === undefined ? undefined : translateGlob(block, { cwd, newestFirst: true, durationMs })
+    if (!translated) return leftToCore(io, 'Glob', e.pattern, `skyline block not translatable: ${headOf(block)}`)
+    return { result: translated }
+  } catch (err) {
+    return leftToCore(io, 'Glob', e.pattern, err instanceof DaemonDown ? `daemon down: ${err.message}` : messageOf(err))
+  }
+}
+
+/** `<dir>/.`: starts the code-tree walk at the directory itself. */
+function directoryMarker(dir: string): string {
+  return dir + (dir.endsWith('/') || dir.endsWith('\\') ? '' : separatorOf(dir)) + '.'
 }
 
 function firstText(content: readonly { type: string; text?: string }[]): string | undefined {

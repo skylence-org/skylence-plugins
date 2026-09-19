@@ -156,6 +156,26 @@ mod's own hook, so core's figure includes the worker hop): core's own Grep
 took 3.2 to 3.7 s per call; skyline answered in 75 to 220 ms. The cause on
 core's side was not profiled.
 
+## Stage 4: answer Glob from skyline
+
+A third hook, on Glob, uses skyline's `find`. Core's Glob record, observed
+the same way:
+
+```jsonc
+{ "filenames": ["sample.txt", "sub\\nested.txt"], "numFiles": 2, "totalMatches": 2,
+  "truncated": false, "countIsComplete": true, "durationMs": 7 }
+```
+
+Filenames are relative to the working directory in the host's separator,
+oldest modification first; core renders them one per line, or `No files
+found`. Both sides let `*.txt` match at any depth, so the pattern passes
+through unchanged. Skyline's only sort is newest first, so the rows are
+turned round. Skyline's headers carry the Windows extended-length prefix
+(`\\?\C:\…`), which is stripped. `durationMs` is the mod's own timing of the
+daemon call. The cap is 100 rows, as core's is before it reports truncation;
+skyline's elision footer (`N match(es), M shown, K elided`) sets
+`totalMatches` and `truncated`.
+
 ### Writing a user-tier mod: what the loader enforces
 
 Anthropic's built-in mods load natively; a plugin's module is checked
