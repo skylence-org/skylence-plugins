@@ -110,16 +110,66 @@ Options (`pluginConfigs` in user settings or `--settings`): `daemonUrl`,
 `answerFromSkyline` (off makes the mod observe only, as stage 1 did),
 `anchorContext`, `shapeFile`.
 
+## Stage 3: answer Grep from skyline
+
+A second hook, on Grep, does the same for searches. Observed on 2.1.278 (the
+mod's stage-1 recorder, pointed at Grep), core's Grep record is one of:
+
+```jsonc
+// output_mode files_with_matches (the default)
+{ "mode": "files_with_matches", "filenames": ["sub\\nested.txt", "sample.txt"], "numFiles": 2, "totalFiles": 2 }
+// output_mode content
+{ "mode": "content", "content": "code.rs-1-fn alpha() {}\ncode.rs:2:let beta = 2;\n--\nsample.txt:2:beta line two",
+  "filenames": [], "numFiles": 2, "numLines": 3, "totalLines": 3 }
+// output_mode count
+{ "mode": "count", "content": "sample.txt:3", "filenames": [], "numFiles": 1, "numMatches": 3 }
+```
+
+Core renders the model-facing text from the record (`Found N files` + the
+names; the content as is; `No files found` / `No matches found` when empty).
+`content` is ripgrep's own rendering: paths relative to the working
+directory in the host's separator (whatever `path` was), `path:N:line` for a
+match and `path-N-line` for a context line when `-n` is set (no number
+otherwise), `--` between context groups, and no path at all when the search
+was one file.
+
+The mod asks skyline's `grep` (`strict: true` so its zero-match fallback
+ladder does not invent matches core would not find, `max_match_chars: 0`,
+`limit` from `head_limit`, `files_with_matches` for files mode, `glob`,
+`ignore_case`, `context`/`after_context`/`before_context`, `skip` from
+`offset`) and renders the block as above. Skyline does not mark context lines,
+so with `-A`/`-B`/`-C` the mod tells a match from a context line by testing
+each line against the pattern as a JavaScript regex; a pattern JavaScript
+cannot compile is left to core. Also left to core: `output_mode: count`
+(skyline's count has no per-file figures), a `type` filter (no ripgrep type
+table on the skyline side), `multiline`, an empty pattern, and everything the
+Read path leaves (outside a code tree, `~/.claude`, permission not allow,
+daemon down or erroring, a block that does not parse).
+
+Known differences from core, both cosmetic: skyline counts a file's trailing
+empty segment as a line, so a context window at the end of a file may show one
+`path-N-` line core would not; and `totalLines`/`totalFiles` equal what was
+returned (no truncation figure from skyline).
+
+Measured in the live runs here, core's own Grep took 3.2 to 3.7 s per call on
+this machine (ripgrep start-up on Windows); skyline answered in 75 to 220 ms.
+
 ### Writing a user-tier mod: what the loader enforces
 
 Anthropic's built-in mods load natively; a plugin's module is checked
 statically before it loads, and the check refused two things on the way here:
 
-- `$` may only be spelled `$.noun.event(...)` at a call site. It cannot be
-  passed to a helper, bound, spread, returned or read. Helpers therefore take
-  closures the hook builds (`fetch: (url, init) => $.http.fetch(url, init)`).
+- `$` may only be spelled `$.noun.event(...)` at a call site, or passed to a
+  function declared at the top of the module (a `function` declaration or a
+  `const` bound to one). It cannot be passed to a nested function or a method,
+  bound, spread, returned or read. So `ioOf($)` is a top-level function that
+  returns closures (`fetch: (url, init) => $.http.fetch(url, init)`) and the
+  rest of the module works with those.
 - `$.env.get` takes a literal variable name, so the variables a module reads
   can be listed.
+- `BuiltinToolInputs` is declared by merging: a tool the fetched
+  `claude-code.d.ts` does not list (Grep, in the checkout used here) gets its
+  own `types/<tool>.d.ts` beside it, committed.
 
 The kit also hands a hook the path as the host spells it: a test's
 `$.fs.exists('/repo/.git')` reaches the hook beneath as `C:\repo\.git` on

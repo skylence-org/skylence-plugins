@@ -1,3 +1,4 @@
+export * from './grep'
 export * from './mcp'
 export * from './register'
 export * from './shape'

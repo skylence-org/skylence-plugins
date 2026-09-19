@@ -72,6 +72,7 @@ function worldOf(on: On, options: { down?: boolean; codeTree?: boolean; cwd?: st
   })
   on('tool.call', ($, e) => {
     if (e.tool === 'Read') coreReads.push(e.file_path)
+    if (e.tool === 'Grep') coreReads.push(`grep:${e.pattern}`)
     return CORE_ANSWER
   })
   const answer = (status: number, headers: Record<string, string>, text: string): { value: HttpResponse } => ({
@@ -221,6 +222,74 @@ describe('register', () => {
     expect(denied.daemon.sent).toEqual([])
     expect(denied.checked).toEqual([{ file_path: '/repo/sample.txt', offset: 2, limit: 1 }])
     expect(denied.debug[0]).toContain('permission deny (Read(./sample.txt) is denied)')
+  })
+
+  test('a Grep in files mode is answered from skyline as core would record it', async ($, on) => {
+    const world = worldOf(on)
+    world.daemon.reply = () => ({
+      text: sse({
+        jsonrpc: '2.0',
+        id: 0,
+        result: { content: [{ type: 'text', text: '¶/repo/sub/b.txt#T1\n¶/repo/a.rs#T2\n\n**Next:** file headers only.' }], isError: false },
+      }),
+    })
+
+    const got = await $.tool.call({ tool: 'Grep', pattern: 'alpha', glob: '*.{txt,rs}' })
+
+    expect(got).toEqual({ result: { mode: 'files_with_matches', filenames: ['sub/b.txt', 'a.rs'], numFiles: 2, totalFiles: 2 } })
+    expect(world.coreReads).toEqual([])
+    const call = world.daemon.sent[2]?.params
+    expect(call?.name).toBe('grep')
+    expect(call?.arguments).toEqual({
+      pattern: 'alpha',
+      path: '/repo',
+      cwd: '/repo',
+      limit: 250,
+      strict: true,
+      max_match_chars: 0,
+      files_with_matches: true,
+      glob: '*.{txt,rs}',
+    })
+    expect(world.checked).toEqual([{ pattern: 'alpha', glob: '*.{txt,rs}' }])
+    expect(world.transcript[0]).toContain('Grep answered by skyline shape #1')
+  })
+
+  test('a Grep in content mode with -n, -i and -C renders as ripgrep would', async ($, on) => {
+    const world = worldOf(on)
+    world.daemon.reply = () => ({
+      text: sse({
+        jsonrpc: '2.0',
+        id: 0,
+        result: {
+          content: [{ type: 'text', text: '2 matches in 1 file.\n¶/repo/sample.txt#E\n1:alpha line one\n2:Beta line two\n3:gamma line three' }],
+          isError: false,
+        },
+      }),
+    })
+
+    const got = await $.tool.call({ tool: 'Grep', pattern: 'beta', output_mode: 'content', '-n': true, '-i': true, '-C': 1, path: 'sub/..' })
+
+    expect(got).toEqual({
+      result: {
+        mode: 'content',
+        content: 'sample.txt-1-alpha line one\nsample.txt:2:Beta line two\nsample.txt-3-gamma line three',
+        filenames: [],
+        numFiles: 1,
+        numLines: 3,
+        totalLines: 3,
+      },
+    })
+    expect(world.daemon.sent[2]?.params?.arguments).toMatchObject({ path: '/repo/sub/..', ignore_case: true, context: 1 })
+  })
+
+  test('a Grep skyline cannot mirror (count mode, a file type) is left to core, unasked', async ($, on) => {
+    const world = worldOf(on)
+
+    await $.tool.call({ tool: 'Grep', pattern: 'x', output_mode: 'count' })
+    await $.tool.call({ tool: 'Grep', pattern: 'x', type: 'rust' })
+
+    expect(world.daemon.sent).toEqual([])
+    expect(world.debug.filter((l) => l.includes('left to core'))).toHaveLength(2)
   })
 
   test('another tool is not touched', async ($, on) => {
