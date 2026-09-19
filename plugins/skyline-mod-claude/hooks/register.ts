@@ -279,9 +279,12 @@ async function answerGrepFromSkyline(
       return leftToCore(io, 'Grep', subject, 'not inside a code tree')
     }
 
-    const input: Record<string, unknown> = { ...e }
-    delete input.tool
-    delete input.tool_use_id
+    // The call's own fields only: the envelope also carries consent and the
+    // agent loop, which are not the question.
+    const input: Record<string, unknown> = { pattern: e.pattern }
+    for (const key of ['path', 'glob', 'output_mode', '-A', '-B', '-C', '-n', '-i', 'head_limit', 'offset'] as const) {
+      if (e[key] !== undefined) input[key] = e[key]
+    }
     const verdict = await io.check(input)
     if (verdict.decision !== 'allow') return leftToCore(io, 'Grep', subject, `permission ${verdictText(verdict)}`)
 

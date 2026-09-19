@@ -151,8 +151,10 @@ empty segment as a line, so a context window at the end of a file may show one
 `path-N-` line core would not; and `totalLines`/`totalFiles` equal what was
 returned (no truncation figure from skyline).
 
-Measured in the live runs here, core's own Grep took 3.2 to 3.7 s per call on
-this machine (ripgrep start-up on Windows); skyline answered in 75 to 220 ms.
+Measured in the live `-p` runs here (one Windows machine, timed from the
+mod's own hook, so core's figure includes the worker hop): core's own Grep
+took 3.2 to 3.7 s per call; skyline answered in 75 to 220 ms. The cause on
+core's side was not profiled.
 
 ### Writing a user-tier mod: what the loader enforces
 
