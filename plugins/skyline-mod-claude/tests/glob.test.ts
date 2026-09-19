@@ -1,6 +1,6 @@
 import { describe, expect, test, tier } from 'claude-code/testing'
 
-import { translateGlob } from '../hooks/glob'
+import { globFilesOf, translateGlob } from '../hooks/glob'
 
 tier('user')
 
@@ -32,6 +32,13 @@ describe('glob', () => {
       truncated: false,
     })
     expect(translateGlob('¶/repo/sub/#T\n¶/repo/a.txt#T', { cwd: '/repo', newestFirst: false, durationMs: 1 })?.filenames).toEqual(['a.txt'])
+  })
+
+  test('denied files are dropped and the total follows; globFilesOf strips the prefix', async () => {
+    const block = '¶\\\\?\\C:\\repo\\secret.txt#S\n¶\\\\?\\C:\\repo\\a.txt#A\n5 match(es), 2 shown, 3 elided'
+    expect(globFilesOf(block)).toEqual(['C:\\repo\\secret.txt', 'C:\\repo\\a.txt'])
+    const got = translateGlob(block, { cwd: 'C:\\repo', newestFirst: true, durationMs: 1, denied: new Set(['C:\\repo\\secret.txt']) })
+    expect(got).toMatchObject({ filenames: ['a.txt'], numFiles: 1, totalMatches: 4, truncated: true })
   })
 
   test('anything else is left to core', async () => {

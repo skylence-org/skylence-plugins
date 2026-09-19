@@ -56,6 +56,11 @@ export type GrepRendering = {
   context: number
   /** Tells a match from a context line when context > 0; undefined otherwise. */
   matches?: (line: string) => boolean
+  /**
+   * Files the permission path would refuse a Read of, as skyline spelled
+   * them: dropped whole, as core drops them from its own results.
+   */
+  denied?: ReadonlySet<string>
 }
 
 const ANCHOR = /^¶(.+)#[A-Za-z0-9]+$/
@@ -121,12 +126,22 @@ export function relativeOf(path: string, cwd: string, sep: string): string {
 }
 
 /**
+ * The files a grep block names, as skyline spelled them, so the caller can
+ * ask the permission path about each before translating. Undefined when the
+ * block is not in the expected form.
+ */
+export function grepFilesOf(block: string): string[] | undefined {
+  return blocksOf(block)?.map((f) => f.path)
+}
+
+/**
  * Translates one grep block. Returns undefined when the block is not in the
  * expected form, so the caller can let core's Grep run instead.
  */
 export function translateGrep(block: string, r: GrepRendering): GrepRecord | undefined {
-  const files = blocksOf(block)
-  if (!files) return undefined
+  const parsed = blocksOf(block)
+  if (!parsed) return undefined
+  const files = r.denied ? parsed.filter((f) => !r.denied!.has(f.path)) : parsed
   const sep = r.cwd.includes('\\') && !r.cwd.includes('/') ? '\\' : '/'
 
   if (r.mode === 'files_with_matches') {

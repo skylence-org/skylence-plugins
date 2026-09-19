@@ -1,7 +1,7 @@
 import type { EngineInterface, On, PluginOptions } from 'claude-code'
 
-import { translateGlob, type GlobRecord } from './glob'
-import { translateGrep, type GrepMode, type GrepRecord } from './grep'
+import { globFilesOf, translateGlob, type GlobRecord } from './glob'
+import { grepFilesOf, translateGrep, type GrepMode, type GrepRecord } from './grep'
 import { DaemonDown, SkylineClient, type Transport } from './mcp'
 import { shapeOf, signatureOf, type Shape } from './shape'
 import { translateRead, type ReadFile } from './translate'
@@ -63,6 +63,11 @@ type Io = Transport & {
   exists: (path: string) => Promise<boolean>
   /** The engine's permission decision for this call, as `$.tool.check` gives it. */
   check: (input: Record<string, unknown>) => Promise<{ decision: string; reason?: string }>
+  /**
+   * The permission decision for a Read of one file. Core applies Read rules
+   * to every file a Grep or Glob would name, so the mod must too.
+   */
+  checkRead: (file_path: string) => Promise<{ decision: string; reason?: string }>
   debug: (text: string) => void
 }
 
@@ -202,8 +207,30 @@ function ioOf($: EngineInterface, tool: 'Read' | 'Grep' | 'Glob'): Io {
     home: async () => (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME')),
     exists: (path) => $.fs.exists(path),
     check: (input) => $.tool.check({ tool, input }),
+    checkRead: (file_path) => $.tool.check({ tool: 'Read', input: { file_path } }),
     debug: (text) => $.ui.log(text, { to: 'debug' }),
   }
+}
+
+/**
+ * The files among `paths` (as skyline spelled them) that the permission path
+ * would refuse a Read of. Core drops such files from its own Grep and Glob
+ * results (a `Read(./secret)` deny rule hides the file from both), so a
+ * result answered from skyline must drop them too.
+ */
+async function deniedAmong(io: Io, paths: readonly string[], cwd: string): Promise<Set<string>> {
+  const verdicts = await Promise.all(paths.map((p) => io.checkRead(hostPath(p, cwd))))
+  const denied = new Set<string>()
+  verdicts.forEach((v, i) => {
+    if (v.decision !== 'allow') denied.add(paths[i]!)
+  })
+  if (denied.size > 0) io.debug(`[skyline-mod] ${denied.size} of ${paths.length} result file(s) dropped: permission not allow`)
+  return denied
+}
+
+/** A path as skyline spelled it, in the host's separator (skyline mixes both on Windows). */
+function hostPath(p: string, cwd: string): string {
+  return separatorOf(cwd) === '\\' ? p.replace(/\//g, '\\') : p
 }
 
 function recorderOf($: EngineInterface): Recorder {
@@ -327,10 +354,10 @@ async function answerGrepFromSkyline(
     if (reply.isError) return leftToCore(io, 'Grep', subject, 'skyline reported an error')
 
     const block = firstText(reply.content)
-    const translated =
-      block === undefined
-        ? undefined
-        : translateGrep(block, { mode, cwd, searchPath, lineNumbers: e['-n'] === true, context, matches })
+    const files = block === undefined ? undefined : grepFilesOf(block)
+    if (block === undefined || !files) return leftToCore(io, 'Grep', subject, `skyline block not translatable: ${headOf(block)}`)
+    const denied = await deniedAmong(io, files, cwd)
+    const translated = translateGrep(block, { mode, cwd, searchPath, lineNumbers: e['-n'] === true, context, matches, denied })
     if (!translated) return leftToCore(io, 'Grep', subject, `skyline block not translatable: ${headOf(block)}`)
     return { result: translated }
   } catch (err) {
@@ -377,7 +404,10 @@ async function answerGlobFromSkyline(
     const durationMs = Math.max(0, (await io.now()) - started)
 
     const block = firstText(reply.content)
-    const translated = block === undefined ? undefined : translateGlob(block, { cwd, newestFirst: true, durationMs })
+    const files = block === undefined ? undefined : globFilesOf(block)
+    if (block === undefined || !files) return leftToCore(io, 'Glob', e.pattern, `skyline block not translatable: ${headOf(block)}`)
+    const denied = await deniedAmong(io, files, cwd)
+    const translated = translateGlob(block, { cwd, newestFirst: true, durationMs, denied })
     if (!translated) return leftToCore(io, 'Glob', e.pattern, `skyline block not translatable: ${headOf(block)}`)
     return { result: translated }
   } catch (err) {

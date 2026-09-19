@@ -1,6 +1,6 @@
 import { describe, expect, test, tier } from 'claude-code/testing'
 
-import { relativeOf, translateGrep } from '../hooks/grep'
+import { grepFilesOf, relativeOf, translateGrep } from '../hooks/grep'
 
 tier('user')
 
@@ -84,6 +84,13 @@ describe('grep', () => {
     const got = translateGrep(block, { cwd: '/repo', searchPath: '/repo', mode: 'content', lineNumbers: true, context: 0 })
     expect(got?.mode === 'content' && got.content).toBe('code.rs:1:fn alpha() {}\ncode.rs:2:let beta = 2;\ncode.rs:3:\nsample.txt:2:beta line two')
     expect(got?.numFiles).toBe(2)
+  })
+
+  test('denied files are dropped whole; grepFilesOf names the files to ask about', async () => {
+    expect(grepFilesOf(TWO_FILES)).toEqual(['C:/repo\\code.rs', 'C:/repo/sub\\sample.txt'])
+    const got = translateGrep(TWO_FILES, { ...WIN, mode: 'content', lineNumbers: true, context: 0, denied: new Set(['C:/repo\\code.rs']) })
+    expect(got?.mode === 'content' && got.content).toBe('sub\\sample.txt:1:alpha line one\nsub\\sample.txt:2:beta line two\nsub\\sample.txt:3:gamma line three')
+    expect(got?.numFiles).toBe(1)
   })
 
   test('anything else is left to core', async () => {

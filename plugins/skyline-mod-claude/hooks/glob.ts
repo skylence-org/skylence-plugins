@@ -33,6 +33,11 @@ export type GlobRendering = {
   /** Whether skyline's rows came newest first (`sort: "mtime"`); core lists oldest first. */
   newestFirst: boolean
   durationMs: number
+  /**
+   * Files the permission path would refuse a Read of, as skyline spelled
+   * them (prefix stripped): dropped, as core drops them from its own results.
+   */
+  denied?: ReadonlySet<string>
 }
 
 const ANCHOR = /^¶(.+?)(#[A-Za-z0-9]+)?$/
@@ -45,14 +50,14 @@ function plain(path: string): string {
   return path.replace(/^(\\\\\?\\|\/\/\?\/)/, '')
 }
 
+type Parsed = { paths: string[]; total: number | undefined; elided: number }
+
 /**
- * Translates one find block. Returns undefined when a line is not a header,
- * the footer, the no-match lines or a trailer, so the caller can let core's
- * Glob run instead. Directory rows (ending in `/`) are dropped: core's Glob
- * lists files.
+ * Splits a find block into file paths (prefix stripped, directory rows
+ * dropped) and its footer figures. Undefined when a line is not a header,
+ * the footer, the no-match lines or a trailer.
  */
-export function translateGlob(block: string, r: GlobRendering): GlobRecord | undefined {
-  const sep = r.cwd.includes('\\') && !r.cwd.includes('/') ? '\\' : '/'
+function parse(block: string): Parsed | undefined {
   const paths: string[] = []
   let total: number | undefined
   let elided = 0
@@ -62,7 +67,7 @@ export function translateGlob(block: string, r: GlobRendering): GlobRecord | und
     const header = ANCHOR.exec(line)
     if (header) {
       const path = plain(header[1] ?? '')
-      if (!path.endsWith('/') && !path.endsWith('\\')) paths.push(relativeOf(path, r.cwd, sep))
+      if (!path.endsWith('/') && !path.endsWith('\\')) paths.push(path)
       continue
     }
     const footer = FOOTER.exec(line)
@@ -74,12 +79,36 @@ export function translateGlob(block: string, r: GlobRendering): GlobRecord | und
     if (TRAILER.test(line)) break
     return undefined
   }
+  return { paths, total, elided }
+}
+
+/**
+ * The files a find block names (prefix stripped), so the caller can ask the
+ * permission path about each before translating. Undefined when the block is
+ * not in the expected form.
+ */
+export function globFilesOf(block: string): string[] | undefined {
+  return parse(block)?.paths
+}
+
+/**
+ * Translates one find block. Returns undefined when the block is not in the
+ * expected form, so the caller can let core's Glob run instead. Directory
+ * rows are dropped: core's Glob lists files.
+ */
+export function translateGlob(block: string, r: GlobRendering): GlobRecord | undefined {
+  const parsed = parse(block)
+  if (!parsed) return undefined
+  const sep = r.cwd.includes('\\') && !r.cwd.includes('/') ? '\\' : '/'
+  const kept = r.denied ? parsed.paths.filter((p) => !r.denied!.has(p)) : parsed.paths
+  const dropped = parsed.paths.length - kept.length
+  const paths = kept.map((p) => relativeOf(p, r.cwd, sep))
   const filenames = r.newestFirst ? paths.reverse() : paths
   return {
     filenames,
     numFiles: filenames.length,
-    totalMatches: total ?? filenames.length,
-    truncated: elided > 0,
+    totalMatches: Math.max(filenames.length, (parsed.total ?? parsed.paths.length) - dropped),
+    truncated: parsed.elided > 0,
     countIsComplete: true,
     durationMs: r.durationMs,
   }

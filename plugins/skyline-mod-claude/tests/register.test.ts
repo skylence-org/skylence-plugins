@@ -40,11 +40,23 @@ type Daemon = {
  * ~/.claude reads, a clock, core's Read, and a skyline daemon over http.fetch
  * that speaks MCP streamable HTTP as the real one does.
  */
-function worldOf(on: On, options: { down?: boolean; codeTree?: boolean; cwd?: string; decision?: 'allow' | 'ask' | 'deny' } = {}) {
+function worldOf(
+  on: On,
+  options: { down?: boolean; codeTree?: boolean; cwd?: string; decision?: 'allow' | 'ask' | 'deny'; denyFile?: string } = {},
+) {
   const cwd = options.cwd ?? '/repo'
   const checked: Record<string, unknown>[] = []
+  const readChecks: string[] = []
   on('tool.check', ($, e) => {
-    checked.push(e.input as Record<string, unknown>)
+    const input = e.input as Record<string, unknown>
+    if (e.tool === 'Read' && Object.keys(input).length === 1 && typeof input.file_path === 'string' && !input.file_path.endsWith('sample.txt')) {
+      // the per-result-file Read check a Grep or Glob answer makes (a Read of sample.txt is the Read tests' own call)
+      readChecks.push(input.file_path)
+      return options.denyFile !== undefined && input.file_path.endsWith(options.denyFile)
+        ? { decision: 'deny', reason: `Read(${options.denyFile}) is denied` }
+        : { decision: 'allow' }
+    }
+    checked.push(input)
     return { decision: options.decision ?? 'allow', ...(options.decision === 'deny' ? { reason: 'Read(./sample.txt) is denied' } : {}) }
   })
   const daemon: Daemon = {
@@ -98,7 +110,7 @@ function worldOf(on: On, options: { down?: boolean; codeTree?: boolean; cwd?: st
     return answer(r.status ?? 200, { 'content-type': 'text/event-stream' }, r.text.replace('"id":0,', `"id":${body.id},`))
   })
 
-  return { daemon, coreReads, transcript, debug, clock, asked, checked }
+  return { daemon, coreReads, transcript, debug, clock, asked, checked, readChecks }
 }
 
 describe('register', () => {
@@ -331,6 +343,32 @@ describe('register', () => {
     expect(none).toMatchObject({ result: { filenames: [], numFiles: 0, totalMatches: 0, truncated: false } })
     expect(outside).toEqual(CORE_ANSWER)
     expect(world.coreReads).toEqual(['glob:*.txt'])
+  })
+
+  test('a file a Read rule denies is dropped from Grep and Glob answers, as core drops it', async ($, on) => {
+    const world = worldOf(on, { denyFile: 'secret.txt' })
+    world.daemon.reply = (call) =>
+      call.params?.name === 'find'
+        ? { text: sse({ jsonrpc: '2.0', id: 0, result: { content: [{ type: 'text', text: '¶/repo/secret.txt#S\n¶/repo/a.txt#A\n2 match(es), 2 shown' }], isError: false } }) }
+        : {
+            text: sse({
+              jsonrpc: '2.0',
+              id: 0,
+              result: {
+                content: [{ type: 'text', text: '2 matches in 2 files.\n¶/repo/secret.txt#S\n1:token=abc\n\n¶/repo/a.txt#A\n1:token=public' }],
+                isError: false,
+              },
+            }),
+          }
+
+    const glob = await $.tool.call({ tool: 'Glob', pattern: '*.txt' })
+    const grep = await $.tool.call({ tool: 'Grep', pattern: 'token', output_mode: 'content', '-n': true })
+
+    expect(glob).toMatchObject({ result: { filenames: ['a.txt'], numFiles: 1, totalMatches: 1 } })
+    expect(grep).toMatchObject({ result: { content: 'a.txt:1:token=public', numFiles: 1, numLines: 1 } })
+    expect(world.readChecks).toEqual(['/repo/secret.txt', '/repo/a.txt', '/repo/secret.txt', '/repo/a.txt'])
+    expect(world.debug.filter((l) => l.includes('result file(s) dropped'))).toHaveLength(2)
+    expect(JSON.stringify(grep)).not.toContain('abc')
   })
 
   test('another tool is not touched', async ($, on) => {

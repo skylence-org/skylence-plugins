@@ -176,6 +176,21 @@ daemon call. The cap is 100 rows, as core's is before it reports truncation;
 skyline's elision footer (`N match(es), M shown, K elided`) sets
 `totalMatches` and `truncated`.
 
+## Permissions, for every answered tool
+
+A hook that answers without `next(e)` skips core's permission path, so each
+answer path asks `$.tool.check` about the call first and leaves anything but
+`allow` to core. That is not enough for Grep and Glob: core also applies Read
+rules to every file its own Grep or Glob would name, so under
+`permissions.deny: ["Read(./sample.txt)"]` core's Glob says `No files found`
+and core's Grep `No matches found`, while a per-call check passes (the search
+itself is allowed). The first 0.4.0 build leaked the file through both; the
+other pane's A/B caught it. The mod now asks `$.tool.check({ tool: "Read",
+input: { file_path } })` for every file skyline returns and drops the ones
+not allowed, whole (a Grep block, a Glob row), before translating. One check
+per result file, in parallel, capped by the result limits (250 Grep rows,
+100 Glob rows).
+
 ### Writing a user-tier mod: what the loader enforces
 
 Anthropic's built-in mods load natively; a plugin's module is checked
