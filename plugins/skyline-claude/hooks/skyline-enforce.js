@@ -18,6 +18,10 @@
 //     `run` while `ps eww` on the same PID showed five. Mirrors the daemon
 //     lifecycle pass-through below: some commands cannot be delegated to the
 //     daemon without changing their meaning.
+//   skylence-plugins#53 — DAEMON-READY GUARD fails open when the tools cannot
+//     serve, not only when nothing answers: 401/403 on /mcp (bearer wall, #50)
+//     and /health maintenance_locked:true (daemon refuses every call). A healthy
+//     daemon (406 on a bare GET /mcp) stays enforced. See probeDaemon.
 // Modes: read | edit | grep | glob | bash (unknown => exit 0)
 
 const http = require("http");
@@ -39,6 +43,8 @@ const MODE = process.argv[2] || "";
 const DAEMON_HOST = process.env.SKYLINE_DAEMON_HOST || "127.0.0.1";
 const DAEMON_PORT = Number(process.env.SKYLINE_DAEMON_PORT || 7333);
 const DAEMON_TIMEOUT = 500;
+// Cap on the /health body the guard will parse (the real body is ~100 bytes).
+const HEALTH_MAX_BYTES = 4096;
 
 // PHP marker: a composer.json in the cwd flags a PHP project, which adds the
 // PHP-oriented symbol_card to the on-ramp menu plus a one-sentence note.
@@ -698,6 +704,134 @@ function toolNameFromInput(input, ti) {
   );
 }
 
+// DAEMON-READY GUARD (skylence-plugins#53). Two concurrent GETs under ONE hard
+// deadline (DAEMON_TIMEOUT; the http `timeout` option is idle-only, and /health
+// reads a body, so it cannot be the bound):
+//
+//   GET /mcp    the tool route. No answer at all => unreachable (fail open).
+//               401/403 => the daemon wants a bearer this plugin does not send
+//               (#50), the MCP connection never forms, the tools are absent
+//               (fail open). ANY OTHER status means up: a healthy daemon
+//               answers a bare GET /mcp with 406 (measured live, 1.2.4), so
+//               "non-2xx means down" would switch enforcement off everywhere.
+//   GET /health the daemon's own report. Read by FIELD, never whole-body.
+//               Only `maintenance_locked === true` (<= 1.2.x) is trusted as
+//               "answers but refuses every tool call"; it is already
+//               qualified by gate_active on the daemon side.
+//
+// NOT used, on purpose: the `acceptance` (<= 1.2.x) and `account` (1.3.x)
+// labels. The daemon reports them on dev builds too, which serve every call,
+// and /health carries no gate_active, so failing open on them would switch
+// enforcement off on healthy daemons. The admin kill-switch and FreeCap are not
+// in /health at all. Those refusals stay uncovered rather than guessed at.
+//
+// Anything /health says that is not a clean JSON object within
+// HEALTH_MAX_BYTES (error status, hang, oversized, wrong shape) means "no
+// extra signal": enforcement stays as it was.
+//
+// Resolves {reachable:false} | {reachable:true, authStatus} |
+// {reachable:true, maintenanceLocked:boolean}.
+function probeDaemon() {
+  return new Promise((resolve) => {
+    let mcpStatus = null; // HTTP status GET /mcp answered; null until it does
+    let health; // undefined = pending, null = unusable, object = parsed body
+    let settled = false;
+    const reqs = [];
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      for (const r of reqs) r.destroy();
+      resolve(result);
+    };
+    // Decide the moment the answer is final: an auth wall needs no /health.
+    const decide = () => {
+      if (mcpStatus === null) return;
+      if (mcpStatus === 401 || mcpStatus === 403) {
+        return finish({ reachable: true, authStatus: mcpStatus });
+      }
+      if (health === undefined) return;
+      finish({
+        reachable: true,
+        maintenanceLocked: !!health && health.maintenance_locked === true,
+      });
+    };
+    const deadline = setTimeout(
+      () =>
+        finish(
+          mcpStatus === null
+            ? { reachable: false }
+            : { reachable: true, maintenanceLocked: false }
+        ),
+      DAEMON_TIMEOUT
+    );
+
+    const get = (urlPath, onRes, onErr) => {
+      const req = http.get(
+        { host: DAEMON_HOST, port: DAEMON_PORT, path: urlPath, timeout: DAEMON_TIMEOUT },
+        onRes
+      );
+      req.on("timeout", () => req.destroy());
+      req.on("error", onErr);
+      reqs.push(req);
+    };
+
+    get(
+      "/mcp",
+      (res) => {
+        res.resume();
+        mcpStatus = res.statusCode;
+        decide();
+      },
+      () => finish({ reachable: false })
+    );
+
+    get(
+      "/health",
+      (res) => {
+        if (res.statusCode !== 200) {
+          res.resume();
+          health = null;
+          return decide();
+        }
+        const chunks = [];
+        let size = 0;
+        res.on("data", (c) => {
+          if (health !== undefined) return;
+          size += c.length;
+          if (size > HEALTH_MAX_BYTES) {
+            health = null;
+            res.destroy();
+            return decide();
+          }
+          chunks.push(c);
+        });
+        res.on("end", () => {
+          if (health !== undefined) return;
+          try {
+            const v = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+            health = v && typeof v === "object" && !Array.isArray(v) ? v : null;
+          } catch {
+            health = null;
+          }
+          decide();
+        });
+        res.on("error", () => {
+          if (health !== undefined) return;
+          health = null;
+          decide();
+        });
+      },
+      () => {
+        if (health !== undefined) return;
+        health = null;
+        decide();
+      }
+    );
+  });
+}
+
 async function main() {
   const known = { read: 1, edit: 1, grep: 1, glob: 1, bash: 1 };
   if (!known[MODE]) {
@@ -779,25 +913,28 @@ async function main() {
     process.exit(0);
   }
 
-  // DAEMON-READY GUARD: probe before any blocking decision
-  const isUp = await new Promise((resolve) => {
-    const req = http.get(
-      { host: DAEMON_HOST, port: DAEMON_PORT, path: "/mcp", timeout: DAEMON_TIMEOUT },
-      (res) => {
-        res.resume();
-        resolve(true);
-      }
-    );
-    req.on("timeout", () => {
-      req.destroy();
-      resolve(false);
-    });
-    req.on("error", () => resolve(false));
-  });
+  // DAEMON-READY GUARD: probe before any blocking decision. "Something
+  // answered" is not "the tools can serve" (skylence-plugins#53), so the probe
+  // also reads what the daemon says about itself; see probeDaemon.
+  const probe = await probeDaemon();
 
-  if (!isUp) {
+  if (!probe.reachable) {
     process.stderr.write(
       `skyline daemon unreachable (${DAEMON_HOST}:${DAEMON_PORT} ≤${DAEMON_TIMEOUT}ms); allowing native tool\n`
+    );
+    process.exit(0);
+  }
+
+  if (probe.authStatus) {
+    process.stderr.write(
+      `skyline daemon answered ${probe.authStatus} on /mcp (${DAEMON_HOST}:${DAEMON_PORT} wants a bearer the plugin does not send, #50); its tools cannot serve this session; allowing native tool\n`
+    );
+    process.exit(0);
+  }
+
+  if (probe.maintenanceLocked) {
+    process.stderr.write(
+      `skyline daemon reports maintenance_locked on /health (${DAEMON_HOST}:${DAEMON_PORT}); it refuses every tool call; allowing native tool\n`
     );
     process.exit(0);
   }
