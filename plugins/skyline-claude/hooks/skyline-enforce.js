@@ -18,6 +18,13 @@
 //     `run` while `ps eww` on the same PID showed five. Mirrors the daemon
 //     lifecycle pass-through below: some commands cannot be delegated to the
 //     daemon without changing their meaning.
+//   skylence-plugins#53: DAEMON-READY GUARD fails open when the tools cannot
+//     serve, not only when nothing answers: 401/403 on /mcp (no bearer, or a
+//     rejected one: the probe sends $SKYLINE_DAEMON_TOKEN, to a loopback
+//     host only, when the hook environment has it, so token-wired sessions
+//     stay enforced) and /health
+//     maintenance_locked:true (daemon refuses every call). A healthy daemon
+//     (406 on a bare GET /mcp) stays enforced. See probeDaemon.
 // Modes: read | edit | grep | glob | bash (unknown => exit 0)
 
 const http = require("http");
@@ -36,9 +43,16 @@ const {
 
 const MODE = process.argv[2] || "";
 
-const DAEMON_HOST = process.env.SKYLINE_DAEMON_HOST || "127.0.0.1";
+// Normalized ONCE: trimmed, and a blank value falls back to the default. This
+// exact value feeds both isLoopbackHost and the http.get connect, so the
+// loopback check and the connection can never disagree about the host (a
+// padded " localhost" would otherwise pass the check yet reach the resolver
+// as-is; an empty host would make http.get connect to its implicit localhost).
+const DAEMON_HOST = (process.env.SKYLINE_DAEMON_HOST || "").trim() || "127.0.0.1";
 const DAEMON_PORT = Number(process.env.SKYLINE_DAEMON_PORT || 7333);
 const DAEMON_TIMEOUT = 500;
+// Cap on the /health body the guard will parse (the real body is ~100 bytes).
+const HEALTH_MAX_BYTES = 4096;
 
 // PHP marker: a composer.json in the cwd flags a PHP project, which adds the
 // PHP-oriented symbol_card to the on-ramp menu plus a one-sentence note.
@@ -698,6 +712,182 @@ function toolNameFromInput(input, ti) {
   );
 }
 
+// Bearer for the /mcp probe, from the hook's own environment. Visible ASCII
+// only: anything else would make http.get throw on the header, and a hook that
+// throws instead of failing open is worse than one that sends no bearer.
+function daemonBearer() {
+  const t = process.env.SKYLINE_DAEMON_TOKEN;
+  return typeof t === "string" && /^[\x21-\x7e]+$/.test(t) ? t : "";
+}
+
+// The token belongs to the local daemon (binary-skyline binds 127.0.0.1 only
+// and keeps its token store loopback-only), so the bearer is sent only when
+// the probe target is loopback: 127.0.0.1, ::1 (with or without brackets) or
+// localhost. Matched by NAME, case-insensitive; never resolved, so a name that
+// merely points at loopback does not qualify. `host` is DAEMON_HOST, already
+// trimmed ONCE where it is defined and the very value http.get connects to, so
+// this comparison and the connection cannot disagree.
+function isLoopbackHost(host) {
+  const h = String(host).toLowerCase();
+  return h === "127.0.0.1" || h === "::1" || h === "[::1]" || h === "localhost";
+}
+
+// DAEMON-READY GUARD (skylence-plugins#53). Two concurrent GETs under ONE hard
+// deadline (DAEMON_TIMEOUT; the http `timeout` option is idle-only, and /health
+// reads a body, so it cannot be the bound):
+//
+//   GET /mcp    the tool route. No answer at all => unreachable (fail open).
+//               Sends `Authorization: Bearer $SKYLINE_DAEMON_TOKEN` when the
+//               hook environment carries one (the token `skyline install`
+//               wires for auth-enabled daemons), so a session whose tools DO
+//               serve is probed the way its MCP client connects and stays
+//               enforced. 401/403 => the daemon wants a bearer this probe did
+//               not have (no token, #50) or rejected the one it sent: fail
+//               open, because the probe cannot show the tools can serve (the
+//               stderr line says which case and claims no more). ANY OTHER
+//               status means up: a
+//               healthy daemon answers a bare GET /mcp with 406 (measured
+//               live, 1.2.4), so "non-2xx means down" would switch
+//               enforcement off everywhere.
+//               The token is never printed; /health is public and gets none.
+//               The bearer goes to a LOOPBACK host only (isLoopbackHost): any
+//               other SKYLINE_DAEMON_HOST gets no Authorization header,
+//               exactly as if no token were set, and a 401/403 there fails
+//               open saying the bearer was withheld. Accepted trade-off: an
+//               auth-enabled daemon behind a tunnel or on another host fails
+//               open.
+//   GET /health the daemon's own report. Read by FIELD, never whole-body.
+//               Only `maintenance_locked === true` (<= 1.2.x) is trusted as
+//               "answers but refuses every tool call"; it is already
+//               qualified by gate_active on the daemon side.
+//
+// NOT used, on purpose: the `acceptance` (<= 1.2.x) and `account` (1.3.x)
+// labels. The daemon reports them on dev builds too, which serve every call,
+// and /health carries no gate_active, so failing open on them would switch
+// enforcement off on healthy daemons. The admin kill-switch and FreeCap are not
+// in /health at all. Those refusals stay uncovered rather than guessed at.
+//
+// Anything /health says that is not a clean JSON object within
+// HEALTH_MAX_BYTES (error status, hang, oversized, wrong shape) means "no
+// extra signal": enforcement stays as it was.
+//
+// Resolves {reachable:false} | {reachable:true, authStatus, bearerSent,
+// bearerWithheld} (both boolean)
+// | {reachable:true, maintenanceLocked:boolean}.
+function probeDaemon() {
+  return new Promise((resolve) => {
+    const token = daemonBearer();
+    const bearer = token !== "" && isLoopbackHost(DAEMON_HOST) ? token : "";
+    const bearerWithheld = token !== "" && bearer === "";
+    let mcpStatus = null; // HTTP status GET /mcp answered; null until it does
+    let health; // undefined = pending, null = unusable, object = parsed body
+    let settled = false;
+    const reqs = [];
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      for (const r of reqs) r.destroy();
+      resolve(result);
+    };
+    // Decide the moment the answer is final: an auth wall needs no /health.
+    const decide = () => {
+      if (mcpStatus === null) return;
+      if (mcpStatus === 401 || mcpStatus === 403) {
+        return finish({
+          reachable: true,
+          authStatus: mcpStatus,
+          bearerSent: bearer !== "",
+          bearerWithheld,
+        });
+      }
+      if (health === undefined) return;
+      finish({
+        reachable: true,
+        maintenanceLocked: !!health && health.maintenance_locked === true,
+      });
+    };
+    const deadline = setTimeout(
+      () =>
+        finish(
+          mcpStatus === null
+            ? { reachable: false }
+            : { reachable: true, maintenanceLocked: false }
+        ),
+      DAEMON_TIMEOUT
+    );
+
+    // `agent: false` (a fresh private agent per request) keeps BOTH probe
+    // requests off Node's env-proxy support: with NODE_USE_ENV_PROXY=1 and
+    // HTTP_PROXY set, the default global agent would send them, bearer
+    // included, to the proxy, and enforcement would follow the proxy's answers.
+    const get = (urlPath, onRes, onErr, headers) => {
+      const req = http.get(
+        { host: DAEMON_HOST, port: DAEMON_PORT, path: urlPath, headers, timeout: DAEMON_TIMEOUT, agent: false },
+        onRes
+      );
+      req.on("timeout", () => req.destroy());
+      req.on("error", onErr);
+      reqs.push(req);
+    };
+
+    get(
+      "/mcp",
+      (res) => {
+        res.resume();
+        mcpStatus = res.statusCode;
+        decide();
+      },
+      () => finish({ reachable: false }),
+      bearer ? { authorization: `Bearer ${bearer}` } : undefined
+    );
+
+    get(
+      "/health",
+      (res) => {
+        if (res.statusCode !== 200) {
+          res.resume();
+          health = null;
+          return decide();
+        }
+        const chunks = [];
+        let size = 0;
+        res.on("data", (c) => {
+          if (health !== undefined) return;
+          size += c.length;
+          if (size > HEALTH_MAX_BYTES) {
+            health = null;
+            res.destroy();
+            return decide();
+          }
+          chunks.push(c);
+        });
+        res.on("end", () => {
+          if (health !== undefined) return;
+          try {
+            const v = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+            health = v && typeof v === "object" && !Array.isArray(v) ? v : null;
+          } catch {
+            health = null;
+          }
+          decide();
+        });
+        res.on("error", () => {
+          if (health !== undefined) return;
+          health = null;
+          decide();
+        });
+      },
+      () => {
+        if (health !== undefined) return;
+        health = null;
+        decide();
+      }
+    );
+  });
+}
+
 async function main() {
   const known = { read: 1, edit: 1, grep: 1, glob: 1, bash: 1 };
   if (!known[MODE]) {
@@ -779,25 +969,34 @@ async function main() {
     process.exit(0);
   }
 
-  // DAEMON-READY GUARD: probe before any blocking decision
-  const isUp = await new Promise((resolve) => {
-    const req = http.get(
-      { host: DAEMON_HOST, port: DAEMON_PORT, path: "/mcp", timeout: DAEMON_TIMEOUT },
-      (res) => {
-        res.resume();
-        resolve(true);
-      }
-    );
-    req.on("timeout", () => {
-      req.destroy();
-      resolve(false);
-    });
-    req.on("error", () => resolve(false));
-  });
+  // DAEMON-READY GUARD: probe before any blocking decision. "Something
+  // answered" is not "the tools can serve" (skylence-plugins#53), so the probe
+  // also reads what the daemon says about itself; see probeDaemon.
+  const probe = await probeDaemon();
 
-  if (!isUp) {
+  if (!probe.reachable) {
     process.stderr.write(
       `skyline daemon unreachable (${DAEMON_HOST}:${DAEMON_PORT} ≤${DAEMON_TIMEOUT}ms); allowing native tool\n`
+    );
+    process.exit(0);
+  }
+
+  if (probe.authStatus) {
+    // Say only what the probe knows: whether a bearer went out, never its value.
+    const why = probe.bearerSent
+      ? "rejected the SKYLINE_DAEMON_TOKEN bearer from the hook environment"
+      : probe.bearerWithheld
+        ? "was sent no bearer (SKYLINE_DAEMON_TOKEN bearer withheld because the host is not loopback)"
+        : "was sent no bearer (SKYLINE_DAEMON_TOKEN is not set or unusable in the hook environment, #50)";
+    process.stderr.write(
+      `skyline daemon answered ${probe.authStatus} on /mcp (${DAEMON_HOST}:${DAEMON_PORT}) and ${why}; allowing native tool\n`
+    );
+    process.exit(0);
+  }
+
+  if (probe.maintenanceLocked) {
+    process.stderr.write(
+      `skyline daemon reports maintenance_locked on /health (${DAEMON_HOST}:${DAEMON_PORT}); it refuses every tool call; allowing native tool\n`
     );
     process.exit(0);
   }
