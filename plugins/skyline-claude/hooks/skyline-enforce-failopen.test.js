@@ -5,8 +5,8 @@
 // reason) whenever the skyline tools cannot serve this session, and keep
 // ENFORCING whenever they can:
 //
-//   1. GET /mcp answers 401 or 403 (daemon wants a bearer the plugin does not
-//      send, #50): the MCP connection never forms, the tools are absent.
+//   1. GET /mcp answers 401 or 403 (no bearer sent, #50, or the bearer was
+//      rejected): the probe cannot show the tools can serve.
 //   2. Nothing answers: unchanged fail-open.
 //   3. A healthy daemon answers GET /mcp with 406 (measured live, 1.2.4) and
 //      /health with status ok: enforcement is unchanged. "Non-2xx means down"
@@ -418,7 +418,7 @@ test("right token in the hook env: bearer goes to /mcp only, healthy daemon stay
       assert.equal(mcp.length, 1, `${label}: one /mcp probe`);
       assert.ok(mcp[0].authorization === `Bearer ${TOKEN}`, `${label}: /mcp carried the bearer`);
       assert.equal(health.length, 1, `${label}: one /health probe`);
-      assert.equal(health[0].authorization, undefined, `${label}: /health carried no Authorization`);
+      assert.ok(health[0].authorization === undefined, `${label}: /health carried no Authorization`);
     }
   });
 });
