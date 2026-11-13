@@ -19,6 +19,13 @@
 // too, which serve every call, and /health carries no gate_active; the admin
 // kill-switch and FreeCap are not in /health at all.
 //
+// Review I1 (PR #54): when SKYLINE_DAEMON_TOKEN is in the hook environment the
+// /mcp probe sends it as a bearer (never /health, which is public), so a
+// session whose tools serve stays enforced. 401/403 still fails open, and the
+// reason says whether no bearer was sent or the one sent was rejected. The
+// token never appears in stderr or stdout. runHook strips the developer's own
+// SKYLINE_DAEMON_TOKEN so only the tests decide whether one is present.
+//
 // The dummy daemon runs IN this process and the hook is spawned ASYNC: a
 // spawnSync here would block the event loop and the dummy could never answer
 // (the hook would then time out and look fail-open for the wrong reason).
@@ -54,11 +61,14 @@ async function startDaemon({
   mcp = 406,
   health = HEALTHY_124,
   healthStatus = 200,
+  token = null, // when set, /mcp answers 401 unless it carries `Bearer <token>`
 } = {}) {
   const requests = [];
+  const auth = []; // {url, authorization} per request, for bearer assertions
   const sockets = new Set();
   const srv = http.createServer((req, res) => {
     requests.push(req.url);
+    auth.push({ url: req.url, authorization: req.headers.authorization });
     if (req.url === "/health") {
       if (health === HANG) return; // never answers
       res.writeHead(healthStatus, { "content-type": "application/json" });
@@ -66,8 +76,9 @@ async function startDaemon({
       return;
     }
     if (mcp === HANG) return; // never answers
-    res.writeHead(mcp, mcp === 401 ? { "www-authenticate": 'Bearer realm="skyline"' } : {});
-    res.end(mcp === 401 ? '{"error":"missing or invalid bearer token"}' : "");
+    const status = token !== null && req.headers.authorization !== `Bearer ${token}` ? 401 : mcp;
+    res.writeHead(status, status === 401 ? { "www-authenticate": 'Bearer realm="skyline"' } : {});
+    res.end(status === 401 ? '{"error":"missing or invalid bearer token"}' : "");
   });
   srv.on("connection", (s) => {
     sockets.add(s);
@@ -77,6 +88,7 @@ async function startDaemon({
   return {
     port: srv.address().port,
     requests,
+    auth,
     close: () =>
       new Promise((resolve) => {
         for (const s of sockets) s.destroy();
@@ -96,22 +108,26 @@ function unusedPort() {
   });
 }
 
-function runHook(mode, port, input) {
+function runHook(mode, port, input, extraEnv = {}) {
   const session = `i53-${process.pid}-${Math.random().toString(36).slice(2)}`;
   const marker = path.join(
     os.tmpdir(),
     `skyline-enforce-reminder-${session.replace(/[^a-z0-9_-]/gi, "_")}.marker`
   );
+  // A token in the developer's own shell must not change what these tests see.
+  const baseEnv = { ...process.env };
+  delete baseEnv.SKYLINE_DAEMON_TOKEN;
   const t0 = process.hrtime.bigint();
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [HOOK, mode], {
       cwd: ROOT,
       env: {
-        ...process.env,
+        ...baseEnv,
         SKYLINE_DAEMON_HOST: "127.0.0.1",
         SKYLINE_DAEMON_PORT: String(port),
         CLAUDE_SESSION_ID: session,
         CLAUDE_PROJECT_DIR: ROOT,
+        ...extraEnv,
       },
     });
     let stdout = "";
@@ -363,5 +379,89 @@ test("/mcp that never answers but /health answers healthy: still unreachable (th
     const r = await runHook("read", d.port, CALLS.Read.input);
     assert.equal(r.status, 0);
     assert.match(r.stderr, /skyline daemon unreachable/);
+  });
+});
+
+// --- review I1 (PR #54): a token-wired session stays enforced -----------------
+// `skyline install` wires SKYLINE_DAEMON_TOKEN into ~/.claude/settings.json env
+// on auth-enabled machines. The hook's /mcp probe sends it as a bearer (never
+// on /health, which is public), so a session whose tools serve is not switched
+// off by the daemon's 401 to an anonymous GET.
+
+const TOKEN = "zq7Kd93xLmP2vRw8";
+const WRONG_TOKEN = "Hn4Tb61cYsE5uJa0";
+
+// Neither the token nor any 6-character piece of it may reach stderr/stdout.
+// Messages never include the piece, so a failure does not leak it either.
+function assertNoTokenLeak(label, r, ...tokens) {
+  for (const tok of tokens) {
+    for (let i = 0; i + 6 <= tok.length; i++) {
+      const piece = tok.slice(i, i + 6);
+      assert.ok(!r.stderr.includes(piece), `${label}: stderr contains a token fragment (offset ${i})`);
+      assert.ok(!r.stdout.includes(piece), `${label}: stdout contains a token fragment (offset ${i})`);
+    }
+  }
+}
+
+const onPath = (d, p) => d.auth.filter((a) => a.url === p);
+
+test("right token in the hook env: bearer goes to /mcp only, healthy daemon stays enforced on every surface", async () => {
+  await withDaemon({ mcp: 406, token: TOKEN }, async (d) => {
+    for (const [label, call] of Object.entries(CALLS)) {
+      d.auth.length = 0;
+      const r = await runHook(call.mode, d.port, call.input, { SKYLINE_DAEMON_TOKEN: TOKEN });
+      assertEnforced(label, r);
+      assert.match(r.stderr, call.substitute, `${label}: substitute text`);
+      assertNoTokenLeak(label, r, TOKEN);
+      const mcp = onPath(d, "/mcp");
+      const health = onPath(d, "/health");
+      assert.equal(mcp.length, 1, `${label}: one /mcp probe`);
+      assert.ok(mcp[0].authorization === `Bearer ${TOKEN}`, `${label}: /mcp carried the bearer`);
+      assert.equal(health.length, 1, `${label}: one /health probe`);
+      assert.equal(health[0].authorization, undefined, `${label}: /health carried no Authorization`);
+    }
+  });
+});
+
+test("no token in the hook env: 401 fails open and says no bearer was sent", async () => {
+  await withDaemon({ mcp: 406, token: TOKEN }, async (d) => {
+    const r = await runHook("read", d.port, CALLS.Read.input);
+    assertAllowed("no token", r, /401 on \/mcp/);
+    assert.match(r.stderr, /was sent no bearer/);
+    assert.match(r.stderr, /SKYLINE_DAEMON_TOKEN is not set or unusable/);
+    assert.doesNotMatch(r.stderr, /rejected/);
+    assert.doesNotMatch(r.stderr, /cannot serve/, "no claim beyond what the probe knows");
+    assertNoTokenLeak("no token", r, TOKEN, WRONG_TOKEN);
+    assert.ok(d.auth.every((a) => a.authorization === undefined), "no Authorization header sent anywhere");
+  });
+});
+
+test("wrong token in the hook env: 401 fails open and says the bearer was rejected", async () => {
+  await withDaemon({ mcp: 406, token: TOKEN }, async (d) => {
+    const r = await runHook("read", d.port, CALLS.Read.input, { SKYLINE_DAEMON_TOKEN: WRONG_TOKEN });
+    assertAllowed("wrong token", r, /401 on \/mcp/);
+    assert.match(r.stderr, /rejected the SKYLINE_DAEMON_TOKEN bearer/);
+    assert.doesNotMatch(r.stderr, /was sent no bearer/);
+    assert.doesNotMatch(r.stderr, /cannot serve/, "no claim beyond what the probe knows");
+    assertNoTokenLeak("wrong token", r, TOKEN, WRONG_TOKEN);
+    const mcp = onPath(d, "/mcp");
+    assert.equal(mcp.length, 1, "one /mcp probe");
+    assert.ok(mcp[0].authorization === `Bearer ${WRONG_TOKEN}`, "/mcp carried the (wrong) bearer");
+    assert.ok(
+      onPath(d, "/health").every((a) => a.authorization === undefined),
+      "/health carried no Authorization"
+    );
+  });
+});
+
+test("a token that is not a plain header value is never sent, and the hook still fails open", async () => {
+  await withDaemon({ mcp: 406, token: TOKEN }, async (d) => {
+    const r = await runHook("read", d.port, CALLS.Read.input, {
+      SKYLINE_DAEMON_TOKEN: `${WRONG_TOKEN}\r\nX-Injected: 1`,
+    });
+    assertAllowed("unusable token", r, /401 on \/mcp/);
+    assert.match(r.stderr, /was sent no bearer/);
+    assertNoTokenLeak("unusable token", r, WRONG_TOKEN);
+    assert.ok(d.auth.every((a) => a.authorization === undefined), "no Authorization header sent anywhere");
   });
 });
