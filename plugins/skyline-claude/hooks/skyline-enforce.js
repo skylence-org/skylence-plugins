@@ -724,9 +724,10 @@ function daemonBearer() {
 //               wires for auth-enabled daemons), so a session whose tools DO
 //               serve is probed the way its MCP client connects and stays
 //               enforced. 401/403 => the daemon wants a bearer this probe did
-//               not have (no token, #50) or rejected the one it sent: the MCP
-//               connection never forms, the tools are absent (fail open, and
-//               the stderr line says which case). ANY OTHER status means up: a
+//               not have (no token, #50) or rejected the one it sent: fail
+//               open, because the probe cannot show the tools can serve (the
+//               stderr line says which case and claims no more). ANY OTHER
+//               status means up: a
 //               healthy daemon answers a bare GET /mcp with 406 (measured
 //               live, 1.2.4), so "non-2xx means down" would switch
 //               enforcement off everywhere.
