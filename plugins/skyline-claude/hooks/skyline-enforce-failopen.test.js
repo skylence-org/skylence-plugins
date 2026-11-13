@@ -306,10 +306,22 @@ test("403 on /mcp fails open", async () => {
 });
 
 test("401 on /mcp does not wait for a slow /health", async () => {
+  // Load-proof: no absolute wall-clock bound. The same hook against a hung
+  // /health that is NOT an auth wall (406) must sit out the whole 500ms
+  // deadline; the 401 run must beat it by most of that deadline, whatever the
+  // box's process-startup cost is right now.
+  const waited = await withDaemon({ mcp: 406, health: HANG }, async (d) => {
+    const r = await runHook("read", d.port, CALLS.Read.input);
+    assertEnforced("406 + hung /health", r);
+    return r.ms;
+  });
   await withDaemon({ mcp: 401, health: HANG }, async (d) => {
     const r = await runHook("read", d.port, CALLS.Read.input);
     assertAllowed("401 + hung /health", r, /401/);
-    assert.ok(r.ms < 450, `answered before the 500ms deadline, took ${r.ms}ms`);
+    assert.ok(
+      r.ms < waited - 250,
+      `401 answered without waiting on /health: ${r.ms}ms vs ${waited}ms when /health is awaited`
+    );
   });
 });
 
