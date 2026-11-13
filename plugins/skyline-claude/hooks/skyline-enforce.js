@@ -43,7 +43,12 @@ const {
 
 const MODE = process.argv[2] || "";
 
-const DAEMON_HOST = process.env.SKYLINE_DAEMON_HOST || "127.0.0.1";
+// Normalized ONCE: trimmed, and a blank value falls back to the default. This
+// exact value feeds both isLoopbackHost and the http.get connect, so the
+// loopback check and the connection can never disagree about the host (a
+// padded " localhost" would otherwise pass the check yet reach the resolver
+// as-is; an empty host would make http.get connect to its implicit localhost).
+const DAEMON_HOST = (process.env.SKYLINE_DAEMON_HOST || "").trim() || "127.0.0.1";
 const DAEMON_PORT = Number(process.env.SKYLINE_DAEMON_PORT || 7333);
 const DAEMON_TIMEOUT = 500;
 // Cap on the /health body the guard will parse (the real body is ~100 bytes).
@@ -718,10 +723,12 @@ function daemonBearer() {
 // The token belongs to the local daemon (binary-skyline binds 127.0.0.1 only
 // and keeps its token store loopback-only), so the bearer is sent only when
 // the probe target is loopback: 127.0.0.1, ::1 (with or without brackets) or
-// localhost. Matched by NAME, trimmed and case-insensitive; never resolved, so
-// a name that merely points at loopback does not qualify.
+// localhost. Matched by NAME, case-insensitive; never resolved, so a name that
+// merely points at loopback does not qualify. `host` is DAEMON_HOST, already
+// trimmed ONCE where it is defined and the very value http.get connects to, so
+// this comparison and the connection cannot disagree.
 function isLoopbackHost(host) {
-  const h = String(host).trim().toLowerCase();
+  const h = String(host).toLowerCase();
   return h === "127.0.0.1" || h === "::1" || h === "[::1]" || h === "localhost";
 }
 
@@ -811,9 +818,13 @@ function probeDaemon() {
       DAEMON_TIMEOUT
     );
 
+    // `agent: false` (a fresh private agent per request) keeps BOTH probe
+    // requests off Node's env-proxy support: with NODE_USE_ENV_PROXY=1 and
+    // HTTP_PROXY set, the default global agent would send them, bearer
+    // included, to the proxy, and enforcement would follow the proxy's answers.
     const get = (urlPath, onRes, onErr, headers) => {
       const req = http.get(
-        { host: DAEMON_HOST, port: DAEMON_PORT, path: urlPath, headers, timeout: DAEMON_TIMEOUT },
+        { host: DAEMON_HOST, port: DAEMON_PORT, path: urlPath, headers, timeout: DAEMON_TIMEOUT, agent: false },
         onRes
       );
       req.on("timeout", () => req.destroy());

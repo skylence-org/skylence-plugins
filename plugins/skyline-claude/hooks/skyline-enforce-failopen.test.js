@@ -561,3 +561,113 @@ test("token + host ::1: bearer sent to /mcp only, healthy daemon stays enforced"
     await d.close();
   }
 });
+
+// --- re-review R2 m1 + m2 (PR #54, round 3) -----------------------------------
+// m1: with Node's env-proxy support on (NODE_USE_ENV_PROXY=1) and HTTP_PROXY
+// set without the daemon host in NO_PROXY, http.get's default agent would send
+// BOTH probe requests, bearer included, to the proxy. The probe must go direct.
+// m2: the host is normalized ONCE (trimmed) and that same value feeds both the
+// loopback comparison and the connect, so they can never disagree.
+
+// The env that engages Node's env-proxy support for `proxyPort`, with every
+// ambient proxy setting of the developer's shell overridden. NO_PROXY is empty
+// so the daemon host is NOT exempted.
+function proxyEnv(proxyPort) {
+  const url = `http://127.0.0.1:${proxyPort}`;
+  return {
+    NODE_USE_ENV_PROXY: "1",
+    HTTP_PROXY: url,
+    http_proxy: url,
+    HTTPS_PROXY: "",
+    https_proxy: "",
+    NO_PROXY: "",
+    no_proxy: "",
+  };
+}
+
+// Does THIS Node actually route a default-agent http.get through the env
+// proxy? Detected by a control child with the same env: if the proxy dummy
+// sees the request the feature is live; if not (older Node, flag unsupported)
+// the m1 test cannot exercise the path and skips with a message.
+function envProxyEngages(proxy, targetPort) {
+  const code =
+    `require("http").get({host:"127.0.0.1",port:${targetPort},path:"/control"},` +
+    `r=>{r.resume();r.on("end",()=>process.exit(0))}).on("error",()=>process.exit(0))`;
+  return new Promise((resolve) => {
+    const baseEnv = { ...process.env };
+    delete baseEnv.SKYLINE_DAEMON_TOKEN;
+    const child = spawn(process.execPath, ["-e", code], {
+      env: { ...baseEnv, ...proxyEnv(proxy.port) },
+      stdio: "ignore",
+    });
+    const timer = setTimeout(() => child.kill(), 3000);
+    child.on("close", () => {
+      clearTimeout(timer);
+      resolve(proxy.requests.length > 0);
+    });
+  });
+}
+
+test("env proxy (NODE_USE_ENV_PROXY=1 + HTTP_PROXY) is bypassed: the proxy sees 0 requests, the daemon gets the bearer on /mcp, enforcement holds", async (t) => {
+  // The proxy answers 403 to everything, so a probe that wrongly goes through
+  // it would fail OPEN (exit 0) and the daemon would see nothing.
+  await withDaemon({ mcp: 403 }, async (proxy) => {
+    await withDaemon({ mcp: 406, token: TOKEN }, async (d) => {
+      if (!(await envProxyEngages(proxy, d.port))) {
+        return t.skip("this Node does not route http.get through NODE_USE_ENV_PROXY/HTTP_PROXY (control request never reached the proxy dummy); case not exercisable here");
+      }
+      proxy.requests.length = 0;
+      d.auth.length = 0;
+      d.requests.length = 0;
+      const r = await runHook("read", d.port, CALLS.Read.input, {
+        ...proxyEnv(proxy.port),
+        SKYLINE_DAEMON_TOKEN: TOKEN,
+      });
+      assert.equal(proxy.requests.length, 0, `the proxy saw requests: ${JSON.stringify(proxy.requests)}`);
+      assertEnforced("env proxy", r);
+      assert.match(r.stderr, CALLS.Read.substitute, "env proxy: substitute text");
+      assertNoTokenLeak("env proxy", r, TOKEN);
+      const mcp = onPath(d, "/mcp");
+      assert.equal(mcp.length, 1, "the real daemon saw one /mcp probe");
+      assert.ok(mcp[0].authorization === `Bearer ${TOKEN}`, "/mcp carried the bearer to the real daemon");
+      assert.equal(onPath(d, "/health").length, 1, "the real daemon saw one /health probe");
+      assert.ok(
+        onPath(d, "/health").every((a) => a.authorization === undefined),
+        "/health carried no Authorization"
+      );
+    });
+  });
+});
+
+test("padded loopback host ' 127.0.0.1 ' is trimmed once: bearer sent to the daemon on /mcp only, healthy daemon stays enforced", async () => {
+  await withDaemon({ mcp: 406, token: TOKEN }, async (d) => {
+    const r = await runHook("read", d.port, CALLS.Read.input, {
+      SKYLINE_DAEMON_TOKEN: TOKEN,
+      SKYLINE_DAEMON_HOST: " 127.0.0.1 ",
+    });
+    assertEnforced("padded host", r);
+    assert.match(r.stderr, CALLS.Read.substitute, "padded host: substitute text");
+    assertNoTokenLeak("padded host", r, TOKEN);
+    const mcp = onPath(d, "/mcp");
+    assert.equal(mcp.length, 1, "padded host: one /mcp probe");
+    assert.ok(mcp[0].authorization === `Bearer ${TOKEN}`, "padded host: /mcp carried the bearer");
+    assert.ok(
+      onPath(d, "/health").every((a) => a.authorization === undefined),
+      "padded host: /health carried no Authorization"
+    );
+  });
+});
+
+test("a blank SKYLINE_DAEMON_HOST falls back to the default 127.0.0.1, not to http.get's implicit localhost", async () => {
+  await withDaemon({ mcp: 406, token: TOKEN }, async (d) => {
+    const r = await runHook("read", d.port, CALLS.Read.input, {
+      SKYLINE_DAEMON_TOKEN: TOKEN,
+      SKYLINE_DAEMON_HOST: "   ",
+    });
+    assertEnforced("blank host", r);
+    assertNoTokenLeak("blank host", r, TOKEN);
+    const mcp = onPath(d, "/mcp");
+    assert.equal(mcp.length, 1, "blank host: one /mcp probe");
+    assert.ok(mcp[0].authorization === `Bearer ${TOKEN}`, "blank host: /mcp carried the bearer (default host is loopback)");
+  });
+});
