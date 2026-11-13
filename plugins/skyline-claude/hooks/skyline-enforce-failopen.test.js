@@ -26,10 +26,17 @@
 // token never appears in stderr or stdout. runHook strips the developer's own
 // SKYLINE_DAEMON_TOKEN so only the tests decide whether one is present.
 //
+// Loopback-only bearer (operator ruling, re-review R1 Minor 1): the bearer is
+// sent only when SKYLINE_DAEMON_HOST is 127.0.0.1, ::1, [::1] or localhost
+// (matched by name, trimmed, case-insensitive, never resolved). Any other host
+// gets no Authorization header, and a 401/403 there fails open saying the
+// bearer was withheld because the host is not loopback.
+//
 // The dummy daemon runs IN this process and the hook is spawned ASYNC: a
 // spawnSync here would block the event loop and the dummy could never answer
 // (the hook would then time out and look fail-open for the wrong reason).
-// Dummies bind ephemeral loopback ports only, never 7333.
+// Dummies bind ephemeral ports only, never 7333 (one loopback-only-bearer test
+// binds 0.0.0.0 so the box's own LAN address reaches it).
 
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
@@ -62,6 +69,7 @@ async function startDaemon({
   health = HEALTHY_124,
   healthStatus = 200,
   token = null, // when set, /mcp answers 401 unless it carries `Bearer <token>`
+  bind = "127.0.0.1", // interface the dummy listens on (0.0.0.0 / ::1 in the loopback-only bearer tests)
 } = {}) {
   const requests = [];
   const auth = []; // {url, authorization} per request, for bearer assertions
@@ -84,7 +92,10 @@ async function startDaemon({
     sockets.add(s);
     s.on("close", () => sockets.delete(s));
   });
-  await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve, reject) => {
+    srv.once("error", reject);
+    srv.listen(0, bind, resolve);
+  });
   return {
     port: srv.address().port,
     requests,
@@ -464,4 +475,89 @@ test("a token that is not a plain header value is never sent, and the hook still
     assertNoTokenLeak("unusable token", r, WRONG_TOKEN);
     assert.ok(d.auth.every((a) => a.authorization === undefined), "no Authorization header sent anywhere");
   });
+});
+
+// --- re-review R1 Minor 1 (PR #54): the bearer goes to loopback only ----------
+// The token is only ever meant for the local daemon (binary-skyline binds
+// 127.0.0.1 and keeps its token store loopback-only), so a SKYLINE_DAEMON_HOST
+// that names anything else must not receive it. Accepted trade-off: an
+// auth-enabled daemon behind a tunnel or on another host answers 401 to the
+// header-less probe and the hook fails open.
+
+function lanAddress() {
+  for (const addrs of Object.values(os.networkInterfaces())) {
+    for (const a of addrs || []) {
+      if (a.family === "IPv4" && !a.internal) return a.address;
+    }
+  }
+  return null;
+}
+
+test("token + non-loopback host: no Authorization header is sent, 401 fails open saying the bearer was withheld", async (t) => {
+  const lan = lanAddress();
+  if (!lan) return t.skip("no non-loopback IPv4 address on this box; case not exercisable here");
+  await withDaemon({ mcp: 406, token: TOKEN, bind: "0.0.0.0" }, async (d) => {
+    const r = await runHook("read", d.port, CALLS.Read.input, {
+      SKYLINE_DAEMON_TOKEN: TOKEN,
+      SKYLINE_DAEMON_HOST: lan,
+    });
+    assert.ok(onPath(d, "/mcp").length === 1, "the dummy was reached on /mcp via the non-loopback address");
+    assert.ok(
+      d.auth.every((a) => a.authorization === undefined),
+      "the dummy saw NO Authorization header on any path"
+    );
+    assertAllowed("non-loopback host", r, /401 on \/mcp/);
+    assert.match(r.stderr, /bearer withheld because the host is not loopback/);
+    assert.doesNotMatch(r.stderr, /rejected/, "no bearer went out, so none was rejected");
+    assert.doesNotMatch(r.stderr, /is not set or unusable/, "the token IS usable; it was withheld");
+    assertNoTokenLeak("non-loopback host", r, TOKEN);
+  });
+});
+
+for (const host of ["127.0.0.1", "localhost", "LocalHost"]) {
+  test(`token + loopback host ${host}: bearer sent to /mcp only, healthy daemon stays enforced`, async () => {
+    await withDaemon({ mcp: 406, token: TOKEN }, async (d) => {
+      const r = await runHook("read", d.port, CALLS.Read.input, {
+        SKYLINE_DAEMON_TOKEN: TOKEN,
+        SKYLINE_DAEMON_HOST: host,
+      });
+      assertEnforced(host, r);
+      assert.match(r.stderr, CALLS.Read.substitute, `${host}: substitute text`);
+      assertNoTokenLeak(host, r, TOKEN);
+      const mcp = onPath(d, "/mcp");
+      assert.equal(mcp.length, 1, `${host}: one /mcp probe`);
+      assert.ok(mcp[0].authorization === `Bearer ${TOKEN}`, `${host}: /mcp carried the bearer`);
+      assert.ok(
+        onPath(d, "/health").every((a) => a.authorization === undefined),
+        `${host}: /health carried no Authorization`
+      );
+    });
+  });
+}
+
+test("token + host ::1: bearer sent to /mcp only, healthy daemon stays enforced", async (t) => {
+  let d;
+  try {
+    d = await startDaemon({ mcp: 406, token: TOKEN, bind: "::1" });
+  } catch (e) {
+    return t.skip(`IPv6 loopback unavailable on this box (${e.code || e.message})`);
+  }
+  try {
+    const r = await runHook("read", d.port, CALLS.Read.input, {
+      SKYLINE_DAEMON_TOKEN: TOKEN,
+      SKYLINE_DAEMON_HOST: "::1",
+    });
+    assertEnforced("::1", r);
+    assert.match(r.stderr, CALLS.Read.substitute, "::1: substitute text");
+    assertNoTokenLeak("::1", r, TOKEN);
+    const mcp = onPath(d, "/mcp");
+    assert.equal(mcp.length, 1, "::1: one /mcp probe");
+    assert.ok(mcp[0].authorization === `Bearer ${TOKEN}`, "::1: /mcp carried the bearer");
+    assert.ok(
+      onPath(d, "/health").every((a) => a.authorization === undefined),
+      "::1: /health carried no Authorization"
+    );
+  } finally {
+    await d.close();
+  }
 });
