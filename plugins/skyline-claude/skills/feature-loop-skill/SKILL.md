@@ -49,7 +49,7 @@ FINAL (all fields MANDATORY, no omissions):
   ├─ SIZE tier chosen + why
   ├─ slices shipped + commit ids
   ├─ test counts (passed/assertions)
-  ├─ advisor checkpoints: COPY the live CHECKPOINT lines emitted during build, one per [post-model / post-first-surface / pre-final] — "skipped silently" is not an option; no line was emitted for a checkpoint ⇒ say so + declare as deviation (reconstruction from git log is the failure mode, not the fix)
+  ├─ advisor checkpoints: COPY the live CHECKPOINT lines emitted during build, one per [post-model / post-first-surface / pre-final]; checkpoint with no live line ⇒ write `CHECKPOINT: <name> = not-emitted` and list it under deviations by name ("None" then not allowed); never reconstruct a done/skipped line after the fact (reconstruction from git log is the failure mode, not the fix)
   └─ deviations from this skill — "None" permitted ONLY when every rule above was followed as written
   WHERE (report = file, chat = one line):
   ├─ path = the one the loop gate gave (post-commit ADVISOR GATE reminder or Stop message) ⇒ create(path, overwrite:true)

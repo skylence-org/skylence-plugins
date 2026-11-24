@@ -17,11 +17,14 @@
  *    mandatory FINAL attestation exists, by EITHER path:
  *      (a) legacy text path (both modes, checked first, needs no fs): SOME
  *          assistant TEXT message this session (not necessarily the last
- *          one) carries all four FINAL fields (missingFields below): a
- *          literal CHECKPOINT line copied from the build, a deviations
- *          mention, slices shipped, test counts;
+ *          one) carries all FINAL fields (missingFields below): a
+ *          literal CHECKPOINT line copied from the build (`= done|skipped|
+ *          n/a`, or `= not-emitted` for a checkpoint that never got a live
+ *          line), a deviations mention, slices shipped, test counts;
+ *          honesty coupling (1.5.36): with a `= not-emitted` line present, a
+ *          deviations line that says only "None" is refused;
  *      (b) report file (file mode only): the FINAL report written to this
- *          session's report file passes the same four field checks.
+ *          session's report file passes the same field checks.
  *    Once attested, later Stops in the same session (e.g. a post-build
  *    debrief turn) pass silently instead of re-demanding the report (field
  *    case 2026-07-26: a haiku session's Stop-gate re-fired on a DEBRIEF turn
@@ -69,7 +72,8 @@
  *
  * Env:
  *  - SKYLINE_LOOP_REPORT = file (default, also any unknown value) | chat.
- *    chat = pre-1.5.35 behavior and messages: only (a) counts. Deliberate
+ *    chat = pre-1.5.35 behavior and messages (except the 1.5.36 not-emitted
+ *    wording of the stop message): only (a) counts. Deliberate
  *    fail-open/robustness differences in chat mode too: an uncaught throw
  *    exits 0 instead of 1, and the block counter uses the sanitized sid and
  *    fails open when it cannot be written (a counter that never sticks used
@@ -96,7 +100,17 @@ const MAX_BLOCKS = 2;
 // the gate once the scan below covers the whole session instead of just the
 // last message.
 const CHECKPOINT_LINE =
-  /checkpoint:\s*(post-model|post-first-surface|pre-final)\s*=\s*(done|skipped|n\/a)/i;
+  /checkpoint:\s*(post-model|post-first-surface|pre-final)\s*=\s*(done|skipped|n\/a|not-emitted)/i;
+// A checkpoint the build never emitted a live line for (1.5.36): honest, but
+// it IS a deviation, so a deviations line reading just "None" contradicts it.
+const NOT_EMITTED_LINE =
+  /checkpoint:\s*(post-model|post-first-surface|pre-final)\s*=\s*not-emitted/i;
+// A line whose label is "deviations" (optionally "deviations from this
+// skill", the SKILL.md FINAL label) after an optional tree glyph / bullet /
+// `#` / `**`, a `:` `—` `–` `-` separator, and a value that is exactly
+// "none" (optional trailing `.`, `**`). "None besides X" does not match.
+const DEVIATIONS_NONE_LINE =
+  /^(?:[ \t│├└─┬┌┐┘┤┴┼•·*_+>#|-]|\d+[.)])*deviations?(?:[ \t]+from[ \t]+(?:(?:this|the)[ \t]+)?(?:feature-loop-)?skill)?[*_]*[ \t]*(?:\r?\n[ \t]*){0,3}[:=—–|-][ \t]*(?:\r?\n[ \t]*){0,3}[*_\x60"'“”‘’]*[ \t]*(?:\r?\n[ \t]*){0,3}none[ \t]*\.?[ \t]*[*_\x60"'“”‘’]*[ \t]*\.?[ \t]*\|?[ \t]*\r?$/im;
 
 // FINAL's "slices shipped + commit ids" field (feature-loop-skill/SKILL.md
 // FINAL:51): a bare "slices...shipped" mention. NOT coupled to a
@@ -114,11 +128,30 @@ const TEST_COUNTS_LINE = /test\s*counts?|\b\d+\s*(passed|failed|tests?|assertion
 // One field table for BOTH attestation paths (legacy chat text and the
 // report file), in a fixed order, so the two can never drift. The keys are
 // what the file-mode block message names when a report is incomplete.
+const COUPLING_KEY = "deviations-none-with-not-emitted";
+const NAMING_KEY = "deviations-not-naming-not-emitted";
+const ANY_CHECKPOINT_LINE_G =
+  /checkpoint:\s*(?:post-model|post-first-surface|pre-final)\s*=\s*(?:done|skipped|n\/a|not-emitted)/gi;
+const NOT_EMITTED_LINE_G =
+  /checkpoint:\s*(post-model|post-first-surface|pre-final)\s*=\s*not-emitted/gi;
+
+// D2b: every not-emitted checkpoint name must also appear OUTSIDE the
+// CHECKPOINT lines (named under deviations); the line itself never counts.
+function unnamedNotEmitted(t) {
+  const names = [...new Set([...t.matchAll(NOT_EMITTED_LINE_G)].map((m) => m[1].toLowerCase()))];
+  if (!names.length) return [];
+  const rest = t.replace(ANY_CHECKPOINT_LINE_G, "").toLowerCase();
+  return names.filter((n) => !rest.includes(n));
+}
+
 const FIELD_CHECKS = [
   ["checkpoint", (t) => CHECKPOINT_LINE.test(t)],
   ["deviations", (t) => t.toLowerCase().includes("deviation")],
   ["slices", (t) => SLICES_SHIPPED_LINE.test(t)],
   ["tests", (t) => TEST_COUNTS_LINE.test(t)],
+  // Appended last: the key order is fixed and named in file-mode messages.
+  [COUPLING_KEY, (t) => !(NOT_EMITTED_LINE.test(t) && DEVIATIONS_NONE_LINE.test(t))],
+  [NAMING_KEY, (t) => unnamedNotEmitted(t).length === 0],
 ];
 
 function missingFields(text) {
@@ -142,12 +175,15 @@ const REPORT_OPEN_FLAGS =
 const LOOP_REPORT_HEADER = /^loop-report: v\d+\s*$/m;
 const HEADER_SCAN_BYTES = 256;
 
-// Pre-1.5.35 texts, byte for byte. Chat mode (SKYLINE_LOOP_REPORT=chat) and
+// Pre-1.5.35 texts, byte for byte, except the 1.5.36 checkpoint clause of
+// FINAL_FIELDS_DEMAND (now asks for `= not-emitted`). Chat mode (SKYLINE_LOOP_REPORT=chat) and
 // any call without a usable report path emit exactly these.
 const COMMIT_CONTEXT =
   "feature-loop-skill ADVISOR GATE: slice just committed. If that was the model slice or the first user-facing surface, consult the advisor NOW, before the next slice. Every checkpoint must appear in FINAL as done or skipped+reason.";
 const FINAL_FIELDS_DEMAND =
-  "slices shipped + commit ids; test counts; advisor checkpoints: COPY the live CHECKPOINT lines emitted during build, one per [post-model / post-first-surface / pre-final] — do not restate or reconstruct them from memory; a checkpoint with no CHECKPOINT line emitted must be said so and declared a deviation; deviations from the skill, where \"None\" is permitted only if every rule was followed as written.";
+  "slices shipped + commit ids; test counts; advisor checkpoints: COPY the live CHECKPOINT lines emitted during build, one per [post-model / post-first-surface / pre-final] — do not restate or reconstruct them from memory; for a checkpoint with no live CHECKPOINT line write `CHECKPOINT: <name> = not-emitted` and list it under deviations by name (then \"None\" is not allowed); deviations from the skill, where \"None\" is permitted only if every rule was followed as written.";
+const COUPLING_NOTE =
+  " The only failing check: a `CHECKPOINT: <name> = not-emitted` line is present, so deviations cannot be \"None\" — list the not-emitted checkpoint under deviations.";
 const LEGACY_STOP_MESSAGE =
   "feature-loop-skill FINAL attestation missing. Before ending: produce the mandatory FINAL report — " +
   FINAL_FIELDS_DEMAND;
@@ -260,6 +296,32 @@ function attestationPresent(text) {
     if (missingFields(t).length === 0) found = true;
   });
   return found;
+}
+
+// Explicit note for the not-emitted honesty rules (coupling, naming) when
+// they are the ONLY failing checks of a text; "" otherwise.
+function softNote(t, missing) {
+  if (!missing.length || !missing.every((k) => k === COUPLING_KEY || k === NAMING_KEY)) return "";
+  let note = "";
+  if (missing.includes(COUPLING_KEY)) note += COUPLING_NOTE;
+  if (missing.includes(NAMING_KEY)) {
+    note += ` Name each not-emitted checkpoint under deviations (not named yet: ${unnamedNotEmitted(t).join(", ")}).`;
+  }
+  return note;
+}
+
+// The soft note of the first assistant message that fails only those rules.
+function chatSoftNote(text) {
+  let note = "";
+  forEachAssistantMessage(text, (content) => {
+    if (note) return;
+    const t = content
+      .filter((c) => c.type === "text")
+      .map((c) => c.text)
+      .join("\n");
+    note = softNote(t, missingFields(t));
+  });
+  return note;
 }
 
 // Report path and block counter share one session-id helper: a raw id like
@@ -382,8 +444,11 @@ function checkReportFile(p) {
     if (n === 0) return { state: "empty" };
     // Grew after lstat (bound by the checkReportFile unit test in the suite).
     if (n > MAX_REPORT_BYTES) return { state: "too-large" };
-    const missing = missingFields(buf.toString("utf8", 0, n));
-    return missing.length ? { state: "fields-missing", missing } : { state: "ok" };
+    const reportText = buf.toString("utf8", 0, n);
+    const missing = missingFields(reportText);
+    return missing.length
+      ? { state: "fields-missing", missing, note: softNote(reportText, missing) }
+      : { state: "ok" };
   } catch (e) {
     return unreadable(e);
   } finally {
@@ -500,7 +565,7 @@ function fileStopMessage(reportFile, report) {
       problem = ` The report file ${at} could not be read (${report.code}); fix the path or its permissions, or print the full FINAL in chat instead (the gate accepts either).`;
       break;
     case "fields-missing":
-      problem = ` The report file ${at} is missing fields: ${report.missing.join(", ")}.`;
+      problem = ` The report file ${at} is missing fields: ${report.missing.join(", ")}.${report.note || ""}`;
       break;
     default:
       break; // absent: the instruction below names the path
@@ -563,7 +628,11 @@ function main() {
     // Fail-open, never wedge a session: past MAX_BLOCKS, or when the counter
     // cannot be persisted (it would never reach MAX_BLOCKS).
     if (n === null || n > MAX_BLOCKS) process.exit(0);
-    process.stderr.write(reportFile ? fileStopMessage(reportFile, report) : LEGACY_STOP_MESSAGE);
+    const base = reportFile ? fileStopMessage(reportFile, report) : LEGACY_STOP_MESSAGE;
+    // The chat note only when no report-file problem is listed beside it
+    // (null = chat mode / no path, absent = nothing written yet).
+    const chatNote = !report || report.state === "absent" ? chatSoftNote(text) : "";
+    process.stderr.write(chatNote && !base.includes(chatNote) ? base + chatNote : base);
     process.exit(2);
   }
 
