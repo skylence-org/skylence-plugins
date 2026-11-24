@@ -51,5 +51,11 @@ FINAL (all fields MANDATORY, no omissions):
   ├─ test counts (passed/assertions)
   ├─ advisor checkpoints: COPY the live CHECKPOINT lines emitted during build, one per [post-model / post-first-surface / pre-final] — "skipped silently" is not an option; no line was emitted for a checkpoint ⇒ say so + declare as deviation (reconstruction from git log is the failure mode, not the fix)
   └─ deviations from this skill — "None" permitted ONLY when every rule above was followed as written
+  WHERE (report = file, chat = one line):
+  ├─ path = the one the loop gate gave (post-commit ADVISOR GATE reminder or Stop message) ⇒ create(path, overwrite:true)
+  ├─ file, one per line: `# feature-loop FINAL` → `loop-report: v1` → `repo: <abs root>` → `branch: <name>` → `date: <UTC ISO>` → the five fields above, labels verbatim (gate matches them)
+  ├─ chat = ONLY `FINAL stored: <path>` + ≤2 short lines (what shipped + suite status; deviations count)
+  ├─ create fails ⇒ print FINAL in chat (gate accepts either)
+  └─ no path given (gate absent, `SKYLINE_LOOP_REPORT=chat`, another harness) ⇒ print FINAL in chat as before
 
 SKYLORE DEPOSIT (with FINAL, sparse): durable decision made during build (library/pattern choice with real alternative) ⇒ lore_mark(kind=decision, why= names beaten alternative); machine/tooling quirk that cost a retry ⇒ lore_mark(kind=fact, why= names expected-instead). NEVER mark manifest-derivable facts, routine milestones, code structure. Skyrift workspace used ⇒ state its path + land/discard status in report.
