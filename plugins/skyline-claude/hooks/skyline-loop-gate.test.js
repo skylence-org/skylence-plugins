@@ -50,6 +50,28 @@ function uniqueSessionId(tag) {
   return `lg-test-${tag}-${process.pid}-${Date.now()}-${seq}`;
 }
 
+// #57: the pre-1.5.35 tests above never remove the block counters their
+// blocked Stops leave in os.tmpdir() (the same dir the hook writes them to).
+// Delete only this run's: name prefix AND "-<pid>-" (uniqueSessionId embeds
+// process.pid), so concurrent runs and unrelated files are untouched.
+function cleanupLegacyCounters(dir = os.tmpdir(), pid = process.pid) {
+  let names = [];
+  try {
+    names = fs.readdirSync(dir);
+  } catch (_e) {
+    return;
+  }
+  for (const n of names) {
+    if (!n.startsWith("skyline-loop-gate-lg-test-") || !n.includes(`-${pid}-`)) continue;
+    try {
+      fs.rmSync(path.join(dir, n), { force: true });
+    } catch (_e) {
+      /* swallow */
+    }
+  }
+}
+after(() => cleanupLegacyCounters());
+
 function freshTmp() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "loop-gate-test-"));
 }
@@ -429,12 +451,13 @@ test("malformed stdin fails open (exit 0, no output)", () => {
 // a report dir under a fresh mkdtemp and a unique session id, cleans up its
 // block counters, and never touches the real ~/.skylence.
 
-// Literals copied from the pre-1.5.35 source (origin/main 3265a42,
-// skyline-loop-gate.js:215 and :231). Chat mode must emit exactly these.
+// Literals of the pre-1.5.35 source (origin/main 3265a42, skyline-loop-gate.js
+// :215 and :231), except the 1.5.36 deliberate change: the checkpoint clause of
+// the stop message now asks for `= not-emitted`. Chat mode must emit exactly these.
 const LEGACY_COMMIT_CONTEXT =
   "feature-loop-skill ADVISOR GATE: slice just committed. If that was the model slice or the first user-facing surface, consult the advisor NOW, before the next slice. Every checkpoint must appear in FINAL as done or skipped+reason.";
 const LEGACY_STOP_MESSAGE =
-  "feature-loop-skill FINAL attestation missing. Before ending: produce the mandatory FINAL report — slices shipped + commit ids; test counts; advisor checkpoints: COPY the live CHECKPOINT lines emitted during build, one per [post-model / post-first-surface / pre-final] — do not restate or reconstruct them from memory; a checkpoint with no CHECKPOINT line emitted must be said so and declared a deviation; deviations from the skill, where \"None\" is permitted only if every rule was followed as written.";
+  "feature-loop-skill FINAL attestation missing. Before ending: produce the mandatory FINAL report — slices shipped + commit ids; test counts; advisor checkpoints: COPY the live CHECKPOINT lines emitted during build, one per [post-model / post-first-surface / pre-final] — do not restate or reconstruct them from memory; for a checkpoint with no live CHECKPOINT line write `CHECKPOINT: <name> = not-emitted` and list it under deviations by name (then \"None\" is not allowed); deviations from the skill, where \"None\" is permitted only if every rule was followed as written.";
 
 const MAX_REPORT_BYTES = 262144;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -1062,4 +1085,216 @@ test("report file (16): checkReportFile enforces the size cap on the read itself
     fs.lstatSync = realLstat;
   }
   assert.deepEqual(res, { state: "too-large" });
+});
+
+// --- 1.5.36 (#56): honest `= not-emitted` checkpoint ------------------------
+
+function finalWith(deviationsLine, checkpointLines) {
+  return [
+    "FINAL report:",
+    "slices shipped: 1 (abc123)",
+    "test counts: 4 passed",
+    "advisor checkpoints:",
+    ...(checkpointLines || ["CHECKPOINT: post-model = not-emitted"]),
+    deviationsLine,
+  ].join("\n");
+}
+
+function chatEntries(text) {
+  return [assistantSkillInvoke("feature-loop-skill"), assistantGitCommit(), assistantText(text)];
+}
+
+// not-emitted checkpoint named in prose (D2b) without a deviations line, so (f) isolates the None grammar
+const NE_NAMED = ["CHECKPOINT: post-model = not-emitted", "(post-model never ran)"];
+const COUPLING_HINT = 'deviations cannot be "None"';
+
+test("not-emitted (a): chat text with a not-emitted line and an honest deviation passes (both modes)", (t) => {
+  for (const mode of [undefined, "chat"]) {
+    const fx = reportFixture(t, "ne-a", chatEntries(finalWith("Deviations: post-model checkpoint not emitted")));
+    const r = fx.stop({ SKYLINE_LOOP_REPORT: mode });
+    assert.equal(r.code, 0, `${mode}: ${r.err}`);
+    assert.equal(r.err, "");
+  }
+});
+
+test("not-emitted (b): same with 'Deviations: None' is refused and the message names the coupling (both modes)", (t) => {
+  for (const mode of [undefined, "chat"]) {
+    const fx = reportFixture(t, "ne-b", chatEntries(finalWith("Deviations: None")));
+    const r = fx.stop({ SKYLINE_LOOP_REPORT: mode });
+    assert.equal(r.code, 2, `${mode}`);
+    assert.ok(r.err.includes(COUPLING_HINT), `${mode}: ${r.err}`);
+  }
+});
+
+test("not-emitted (c): 'None besides X' is a real deviation and passes", (t) => {
+  const fx = reportFixture(t, "ne-c", chatEntries(finalWith("Deviations: None besides the missing post-model line")));
+  assert.equal(fx.stop().code, 0);
+  const fx2 = reportFixture(t, "ne-c2", chatEntries(finalWith("Deviations: none except post-model")));
+  assert.equal(fx2.stop().code, 0);
+});
+
+test("not-emitted (d): report file path: honest deviation passes, 'None' is refused and names the key + coupling", (t) => {
+  const ok = reportFixture(t, "ne-d1");
+  fs.writeFileSync(ok.report, "# feature-loop FINAL\nloop-report: v1\n" + finalWith("└─ deviations from this skill: post-model not emitted") + "\n");
+  assert.equal(ok.stop().code, 0);
+  const bad = reportFixture(t, "ne-d2");
+  fs.writeFileSync(bad.report, "# feature-loop FINAL\nloop-report: v1\n" + finalWith("└─ deviations from this skill: None") + "\n");
+  const r = bad.stop();
+  assert.equal(r.code, 2);
+  assert.ok(r.err.includes("deviations-none-with-not-emitted"), r.err);
+  assert.ok(r.err.includes(COUPLING_HINT), r.err);
+});
+
+test("not-emitted (e): no not-emitted line + 'Deviations: None' still passes (unchanged)", (t) => {
+  const fx = reportFixture(t, "ne-e", chatEntries(FINAL_ATTESTATION_TEXT));
+  assert.equal(fx.stop().code, 0);
+  const fx2 = reportFixture(t, "ne-e2", chatEntries(finalWith("Deviations: None", ["CHECKPOINT: post-model = done"])));
+  assert.equal(fx2.stop().code, 0);
+});
+
+test("not-emitted (f): bullet / bold / tree variants of a bare None are refused", (t) => {
+  for (const dev of [
+    "- **Deviations:** None.",
+    "└─ deviations: none",
+    "**Deviations**: None",
+    "# Deviations — none.",
+    "│  DEVIATIONS - None ",
+    "Deviations from the skill: None",
+    "└─ deviations from this skill: None",
+    "5. Deviations: None",
+    "5) deviations from this skill: None",
+    "Deviations from skill: None",
+    "Deviations = None",
+    "| Deviations | None |",
+    "Deviations: `None`",
+    'Deviations: "None"',
+    '└─ deviations from this skill — "None"',
+    "└─ deviations from this skill:\n   None",
+    "**Deviations:**\nNone",
+    "- **Deviations:**\n  None.",
+    "Deviations:\n\nNone",
+    "## Deviations\n- None",
+  ]) {
+    const fx = reportFixture(t, "ne-f", chatEntries(finalWith(dev, NE_NAMED)));
+    assert.equal(fx.stop().code, 2, dev);
+  }
+});
+
+test("not-emitted (f2): no recognisable deviations line keeps the plain mention rule", (t) => {
+  const fx = reportFixture(t, "ne-f2", chatEntries(finalWith("Note: a deviation happened in post-model, see above")));
+  assert.equal(fx.stop().code, 0);
+});
+
+// --- #57: legacy tests clean up their counters --------------------------------
+
+test("cleanup (g): removes this run's lg-test counters in os.tmpdir(), leaves a decoy from another pid", (t) => {
+  const fx = reportFixture(t, "g-fx", [assistantSkillInvoke("feature-loop-skill"), assistantGitCommit(), assistantText("wip")]);
+  const sid = uniqueSessionId("x");
+  // The legacy spawn helper (no explicit env) blocks and leaves a counter.
+  const r = runStop(fx.transcript, sid);
+  assert.equal(r.code, 2);
+  const mine = counterFile(sid);
+  const decoy = path.join(os.tmpdir(), `skyline-loop-gate-lg-test-y-99999999-${crypto.randomBytes(4).toString("hex")}-1`);
+  fs.writeFileSync(decoy, "1");
+  t.after(() => fs.rmSync(decoy, { force: true }));
+  t.after(() => fs.rmSync(mine, { force: true }));
+  assert.ok(fs.existsSync(mine), "counter exists before cleanup");
+  cleanupLegacyCounters();
+  assert.ok(!fs.existsSync(mine), "own-pid counter removed");
+  assert.ok(fs.existsSync(decoy), "other-pid decoy untouched");
+});
+
+test("not-emitted (h): coupling note is not appended beside a report file that lists other missing fields", (t) => {
+  const chat = ["slices shipped: 1 (abc)", "test counts: 4 passed", "CHECKPOINT: post-model = not-emitted", "Deviations: None"].join("\n");
+  const fx = reportFixture(t, "ne-h", chatEntries(chat));
+  fs.writeFileSync(fx.report, "# feature-loop FINAL\nloop-report: v1\nnotes only\n");
+  const r = fx.stop();
+  assert.equal(r.code, 2);
+  assert.ok(r.err.includes("is missing fields: checkpoint, deviations, slices, tests"), r.err);
+  assert.ok(!r.err.includes("The only failing check"), r.err);
+});
+
+// --- D2b: every not-emitted checkpoint must be NAMED outside its CHECKPOINT line ---
+
+const ALL_NE = [
+  "CHECKPOINT: post-model = not-emitted",
+  "CHECKPOINT: post-first-surface = not-emitted",
+  "CHECKPOINT: pre-final = not-emitted",
+];
+const NAMED_ALL = "Deviations: post-model, post-first-surface and pre-final checkpoints not emitted";
+
+function reportBody(text) {
+  return "# feature-loop FINAL\nloop-report: v1\n" + text + "\n";
+}
+
+test("not-emitted (i): 3x not-emitted + 'No deviations.' is refused; naming all three passes (chat and file)", (t) => {
+  const bad = reportFixture(t, "ne-i", chatEntries(finalWith("No deviations.", ALL_NE)));
+  const r = bad.stop();
+  assert.equal(r.code, 2);
+  assert.ok(r.err.includes("not named yet: post-model, post-first-surface, pre-final"), r.err);
+  const ok = reportFixture(t, "ne-i2", chatEntries(finalWith(NAMED_ALL, ALL_NE)));
+  assert.equal(ok.stop().code, 0);
+});
+
+test("not-emitted (j): not-emitted post-model + deviations naming post-model passes", (t) => {
+  const fx = reportFixture(t, "ne-j", chatEntries(finalWith("Deviations: post-model checkpoint not emitted")));
+  assert.equal(fx.stop().code, 0);
+});
+
+test("not-emitted (k): post-model and pre-final not-emitted, only post-model named: refused, message names pre-final", (t) => {
+  const cps = ["CHECKPOINT: post-model = not-emitted", "CHECKPOINT: pre-final = not-emitted"];
+  const fx = reportFixture(t, "ne-k", chatEntries(finalWith("Deviations: post-model was not emitted", cps)));
+  const r = fx.stop();
+  assert.equal(r.code, 2);
+  assert.ok(r.err.includes("not named yet: pre-final"), r.err);
+  assert.ok(!r.err.includes("not named yet: post-model"), r.err);
+});
+
+test("not-emitted (l): (i), (j), (k) through the report file", (t) => {
+  const bad = reportFixture(t, "ne-l1");
+  fs.writeFileSync(bad.report, reportBody(finalWith("└─ deviations from this skill: No deviations.", ALL_NE)));
+  const r1 = bad.stop();
+  assert.equal(r1.code, 2);
+  assert.ok(r1.err.includes("deviations-not-naming-not-emitted"), r1.err);
+  assert.ok(r1.err.includes("not named yet: post-model, post-first-surface, pre-final"), r1.err);
+  const ok = reportFixture(t, "ne-l2");
+  fs.writeFileSync(ok.report, reportBody(finalWith("└─ deviations from this skill: post-model not emitted")));
+  assert.equal(ok.stop().code, 0);
+  const part = reportFixture(t, "ne-l3");
+  const cps = ["CHECKPOINT: post-model = not-emitted", "CHECKPOINT: pre-final = not-emitted"];
+  fs.writeFileSync(part.report, reportBody(finalWith("└─ deviations: post-model was not emitted", cps)));
+  const r3 = part.stop();
+  assert.equal(r3.code, 2);
+  assert.ok(r3.err.includes("not named yet: pre-final"), r3.err);
+});
+
+test("not-emitted (m): the CHECKPOINT line itself does not count as naming the checkpoint", (t) => {
+  const fx = reportFixture(t, "ne-m", chatEntries(finalWith("Deviations: see above", ["CHECKPOINT: post-model = not-emitted"])));
+  assert.equal(fx.stop().code, 2);
+});
+
+test("not-emitted (n): the seven reviewer question forms each exit 2", (t) => {
+  const forms = [
+    "No deviations.",
+    "## Deviations\nNone",
+    "Deviations:\n- None",
+    "Deviations: None (all rules followed)",
+    "Deviations: N/A",
+    "Deviations: none ✓",
+    "We discuss deviations only in passing here.",
+  ];
+  for (const dev of forms) {
+    const fx = reportFixture(t, "ne-n", chatEntries(finalWith(dev)));
+    assert.equal(fx.stop().code, 2, JSON.stringify(dev));
+  }
+});
+
+test("not-emitted (o): a not-emitted line plus 256 KB of blank lines is checked in < 500 ms", () => {
+  const { missingFields } = require(HOOK);
+  const big = finalWith("Deviations:" + "\n".repeat(262144) + "post-model not emitted");
+  const start = process.hrtime.bigint();
+  missingFields(big);
+  missingFields(finalWith("Deviations:" + " \n".repeat(131072)));
+  const ms = Number(process.hrtime.bigint() - start) / 1e6;
+  assert.ok(ms < 500, `took ${ms} ms`);
 });
