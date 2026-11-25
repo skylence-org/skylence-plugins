@@ -13,10 +13,11 @@ const path = require("path");
 
 const HOOK = path.resolve(__dirname, "skyline-skylore-deposit.js");
 
-// Every session id used below MUST be listed here: cleanMarkers() runs at load
+// Every marker key used below MUST be listed here: cleanMarkers() runs at load
 // and in after(), and a marker left behind makes the NEXT suite's first fire
 // (e.g. the grok twin, which shares $TMPDIR and the marker naming) a silent
-// no-block, which surfaces as a JSON.parse of "".
+// no-block, which surfaces as a JSON.parse of "". Since 1.5.38 the key is the
+// stdin session_id (else the parent pid), so run() sends sess as session_id.
 const SESSIONS = [
   "sess-deposit-once",
   "sess-deposit-active",
@@ -43,7 +44,7 @@ after(cleanMarkers);
 function run(input, sess) {
   return spawnSync(process.execPath, [HOOK], {
     encoding: "utf8",
-    input: JSON.stringify(input),
+    input: JSON.stringify({ session_id: sess, ...input }),
     env: { ...process.env, CLAUDE_SESSION_ID: sess },
   });
 }
@@ -117,9 +118,11 @@ test("the skill the prompt names exists and its frontmatter name matches", () =>
 });
 
 // --- 1.5.37: silent answer (Q5) and the chat switch (Q6) --------------------
-// Marker keys (CLAUDE_SESSION_ID) are pid-suffixed `sess-qlr-*` names, never
-// the grok twin's `sess-deposit-*` ones, and every one is pushed onto SESSIONS
-// so after(cleanMarkers) removes it. Report dirs are fresh temp dirs.
+// Marker keys are the stdin session_id since 1.5.38: each fixture's own
+// pid-suffixed `qlr-*` id (pushed onto SESSIONS, so after(cleanMarkers)
+// removes it), never the grok twin's `sess-deposit-*` ones. CLAUDE_SESSION_ID
+// (`sess-qlr-*`) only keys the 1.5.36 hook of the differential test. Report
+// dirs are fresh temp dirs.
 
 const helper = require("./loop-report-path");
 const gate = require("./skyline-loop-gate");
@@ -141,6 +144,8 @@ function qFixture(t, tag) {
   const dir = path.join(tmp, "reports");
   fs.mkdirSync(dir);
   const sessionId = `qlr-${tag}-${process.pid}-${Date.now()}`;
+  SESSIONS.push(sessionId);
+  fs.rmSync(markerPath(sessionId), { force: true });
   const transcript = path.join(tmp, "transcript.jsonl");
   fs.writeFileSync(transcript, "");
   const paths = helper.reportPaths(sessionId, { SKYLINE_LOOP_REPORT_DIR: dir });
@@ -173,7 +178,7 @@ test("Q5: an assistant lore_mark / lore_supersede tool_use in the transcript ans
     const r = runQ(fx, sess);
     assert.equal(r.status, 0);
     assert.equal(r.out, "", `${name}: silent`);
-    assert.equal(fs.existsSync(markerPath(sess)), false, "no marker taken by a silent pass");
+    assert.equal(fs.existsSync(markerPath(fx.sessionId)), false, "no marker taken by a silent pass");
   }
 });
 
@@ -231,7 +236,7 @@ test("Q5: a `skylore:` line at column 0 in the FINAL, debug or review report ans
   assert.ok(r.block, "a tree-prefixed skylore line is not a column-0 answer");
 });
 
-test("Q5: neither: blocks ONCE, names the newest existing report file (append, never overwrite); then never again", (t) => {
+test("Q5: neither: blocks ONCE, names the newest existing report file (append, or include it in the report you write); then never again", (t) => {
   const fx = qFixture(t, "once");
   const sess = qlrSess("once");
   fs.writeFileSync(fx.paths.final, "# feature-loop FINAL\nloop-report: v1\nslices shipped: 1\n");
@@ -242,8 +247,11 @@ test("Q5: neither: blocks ONCE, names the newest existing report file (append, n
   assert.equal(r1.status, 0);
   assert.equal(r1.block.decision, "block");
   const reason = r1.block.reason;
-  assert.ok(reason.includes(`append one line \`skylore: nothing durable\` to \`${fx.paths.debug}\``), reason);
-  assert.match(reason, /never overwrite that file/);
+  assert.ok(
+    reason.includes(`append the \`skylore:\` line (\`skylore: nothing durable\`) to \`${fx.paths.debug}\`, or include it in the report you write.`),
+    reason
+  );
+  assert.doesNotMatch(reason, /never overwrite/, "M3: no contradiction with the gate's create (overwrite:true)");
   assert.doesNotMatch(reason, /does not exist yet/);
   // The pinned invariants of the prompt survive the file wording.
   assert.match(reason, /re-derive/);
@@ -253,24 +261,29 @@ test("Q5: neither: blocks ONCE, names the newest existing report file (append, n
   assert.ok(reason.length < 800, `still a pointer (${reason.length} chars)`);
   const r2 = runQ(fx, sess);
   assert.equal(r2.out, "", "second Stop: no block");
-  const r3 = runQ(fx, qlrSess("once-active"), { extra: { stop_hook_active: true } });
+  const r3 = runQ(fx, qlrSess("once-active"), { extra: { stop_hook_active: true, session_id: `${fx.sessionId}-active` } });
   assert.equal(r3.out, "", "stop_hook_active: no block");
 });
 
-test("Q5: no report file yet: names the FINAL path with the create-with-header hint; following it literally answers the next session", (t) => {
-  const fx = qFixture(t, "stub");
-  const sess = qlrSess("stub");
-  const r = runQ(fx, sess);
+test("M2: no report file this session: the pre-1.5.37 chat prompt, no file named, nothing written", (t) => {
+  const fx = qFixture(t, "nofile");
+  const r = runQ(fx, qlrSess("nofile"));
   assert.equal(r.block.decision, "block");
-  const reason = r.block.reason;
-  assert.ok(reason.includes(`to \`${fx.paths.final}\` (it does not exist yet: create it with the lines \`# skylore REPORT\` and \`loop-report: v1\` first)`), reason);
-  // Follow the instruction literally.
-  fs.writeFileSync(fx.paths.final, "# skylore REPORT\nloop-report: v1\nskylore: nothing durable\n");
-  const again = runQ(fx, qlrSess("stub-fresh"));
-  assert.equal(again.out, "", "fresh marker, same session_id: silent");
-  assert.equal(gate.isLoopReport(fx.paths.final), true, "the stub carries the header, so retention can prune it");
-  // A stub at the FINAL path never satisfies the Stop gate's FINAL fields.
-  assert.deepEqual(gate.missingFields(fs.readFileSync(fx.paths.final, "utf8")).slice(0, 4), ["checkpoint", "deviations", "slices", "tests"]);
+  assert.equal(r.block.reason, DEPOSIT_PROMPT_LEGACY);
+  assert.deepEqual(fs.readdirSync(fx.dir), [], "no stub report is asked for or created");
+});
+
+test("M2/M3: a FINAL report file exists: the prompt names it and says append, or include it in the FINAL you write", (t) => {
+  const fx = qFixture(t, "final-only");
+  fs.writeFileSync(fx.paths.final, "# feature-loop FINAL\nloop-report: v1\nCHECKPOINT: post-model = done\n");
+  const r = runQ(fx, qlrSess("final-only"));
+  assert.ok(
+    r.block.reason.includes(`append the \`skylore:\` line (\`skylore: nothing durable\`) to \`${fx.paths.final}\`, or include it in the FINAL you write.`),
+    r.block.reason
+  );
+  // The gate's Stop message gives the same instruction for the same file.
+  const gateSrc = fs.readFileSync(path.join(__dirname, "skyline-loop-gate.js"), "utf8");
+  assert.ok(gateSrc.includes("append the \\`skylore:\\` line, or include it in the FINAL you write"));
 });
 
 test("Q5: fail-open: garbage transcript, a directory as transcript, JSON null: exit 0, at most one well-formed block", (t) => {
@@ -279,7 +292,9 @@ test("Q5: fail-open: garbage transcript, a directory as transcript, JSON null: e
   let r = runQ(fx, qlrSess("garbage"));
   assert.equal(r.status, 0);
   assert.equal(r.block.decision, "block", "no evidence => the normal single block");
-  r = runQ(fx, qlrSess("garbage-dir"), { extra: { transcript_path: fx.dir } });
+  const dirSid = `${fx.sessionId}-dir`;
+  SESSIONS.push(dirSid);
+  r = runQ(fx, qlrSess("garbage-dir"), { extra: { transcript_path: fx.dir, session_id: dirSid } });
   assert.equal(r.status, 0);
   assert.equal(r.block.decision, "block");
   const nul = spawnSync(process.execPath, [HOOK], {
@@ -294,7 +309,7 @@ test("Q5: fail-open: garbage transcript, a directory as transcript, JSON null: e
 test("Q5: an already-taken marker exits before any transcript or report read", (t) => {
   const fx = qFixture(t, "taken");
   const sess = qlrSess("taken");
-  fs.writeFileSync(markerPath(sess), "");
+  fs.writeFileSync(markerPath(fx.sessionId), "");
   // A transcript path that would answer the check is irrelevant: the marker wins.
   const r = runQ(fx, sess, { extra: { transcript_path: path.join(fx.tmp, "missing.jsonl") } });
   assert.equal(r.status, 0);
@@ -313,11 +328,15 @@ test("Q6: SKYLINE_LOOP_REPORT=chat blocks as before: lore_* calls and skylore li
   assert.equal(runQ(fx, sess, { mode: "chat" }).out, "", "still exactly once");
 });
 
-test("Q5: file mode without a usable session_id keeps the legacy prompt", (t) => {
+test("Q5: file mode without a usable session_id keeps the legacy prompt (marker keyed by the parent pid)", (t) => {
   const fx = qFixture(t, "nosid");
+  const ppidKey = String(process.pid); // the hook's ppid is this test process
+  SESSIONS.push(ppidKey);
   for (const sid of [undefined, ".", 42]) {
+    fs.rmSync(markerPath(ppidKey), { force: true });
     const r = runQ(fx, qlrSess(`nosid-${String(sid)}`), { extra: { session_id: sid } });
     assert.equal(r.block.reason, DEPOSIT_PROMPT_LEGACY, `session_id ${String(sid)}`);
+    assert.ok(fs.existsSync(markerPath(ppidKey)), "ppid fallback key");
   }
 });
 
@@ -338,16 +357,24 @@ test("Q6 differential: chat mode output equals the 1.5.36 deposit hook for the s
   fs.writeFileSync(old, show.stdout);
   fs.writeFileSync(fx.transcript, jsonl([toolUse("mcp__skyline__lore_mark")]));
   fs.writeFileSync(fx.paths.review, "loop-report: v1\nskylore: nothing durable\n");
+  // Distinct stdin session ids per case: the new hook keys its marker on it,
+  // the old one on CLAUDE_SESSION_ID (qlrSess), so neither run sees the
+  // other's marker. Case 2 (no session_id) keys the new hook on the ppid.
+  const ppidKey = String(process.pid);
+  SESSIONS.push(ppidKey);
   const cases = [{}, { stop_hook_active: true }, { session_id: undefined }, { transcript_path: undefined }];
   cases.forEach((extra, i) => {
-    const now = runQ(fx, qlrSess(`diff-new-${i}`), { mode: "chat", extra });
-    const then = runQ(fx, qlrSess(`diff-old-${i}`), { mode: "chat", extra, hook: old });
+    const sid = `${fx.sessionId}-c${i}`;
+    SESSIONS.push(sid);
+    if (i === 2) fs.rmSync(markerPath(ppidKey), { force: true });
+    const now = runQ(fx, qlrSess(`diff-new-${i}`), { mode: "chat", extra: { session_id: sid, ...extra } });
+    const then = runQ(fx, qlrSess(`diff-old-${i}`), { mode: "chat", extra: { session_id: sid, ...extra }, hook: old });
     assert.equal(now.status, then.status, `case ${i}`);
     assert.equal(now.out, then.out, `case ${i}`);
   });
   // And the repeat Stop (marker taken) in both.
-  assert.equal(runQ(fx, `sess-qlr-diff-new-0-${process.pid}`, { mode: "chat" }).out, "");
-  assert.equal(runQ(fx, `sess-qlr-diff-old-0-${process.pid}`, { mode: "chat", hook: old }).out, "");
+  assert.equal(runQ(fx, `sess-qlr-diff-new-0-${process.pid}`, { mode: "chat", extra: { session_id: `${fx.sessionId}-c0` } }).out, "");
+  assert.equal(runQ(fx, `sess-qlr-diff-old-0-${process.pid}`, { mode: "chat", extra: { session_id: `${fx.sessionId}-c0` }, hook: old }).out, "");
 });
 
 // Skill text <-> hook contract: each loop skill prescribes its report header
@@ -373,4 +400,76 @@ test("Q5: the report shape each loop SKILL.md prescribes (header + column-0 skyl
     assert.equal(r.status, 0);
     assert.equal(r.out, "", `${skill} shape: silent`);
   }
+});
+
+// --- 1.5.38: marker key and fork scoping (audit I3) -------------------------
+
+// Runs the hook as the child of a fresh intermediate process, so its ppid
+// differs from the other runs' (a resumed Claude Code session is a new
+// process with the same session_id).
+function runViaNewParent(input, reportDir) {
+  const res = spawnSync(
+    process.execPath,
+    [
+      "-e",
+      'const r = require("child_process").spawnSync(process.execPath, [process.argv[1]], { input: process.argv[2], encoding: "utf8", env: process.env }); process.stdout.write(r.stdout || "");',
+      HOOK,
+      JSON.stringify(input),
+    ],
+    {
+      encoding: "utf8",
+      env: (() => {
+        const e = { ...process.env, SKYLINE_LOOP_REPORT_DIR: reportDir };
+        delete e.CLAUDE_SESSION_ID;
+        delete e.SKYLINE_LOOP_REPORT;
+        return e;
+      })(),
+    }
+  );
+  return res.stdout.trim();
+}
+
+test("I3 marker: keyed by the stdin session_id: two sessions under one parent each block once; a resume (new process, same id) does not re-fire", (t) => {
+  const fx = qFixture(t, "key-a");
+  const other = `${fx.sessionId}-b`;
+  SESSIONS.push(other);
+  const env = { ...process.env, SKYLINE_LOOP_REPORT_DIR: fx.dir };
+  delete env.CLAUDE_SESSION_ID; // the real hook env has none (audit live facts)
+  delete env.SKYLINE_LOOP_REPORT;
+  const go = (sid) =>
+    spawnSync(process.execPath, [HOOK], { encoding: "utf8", env, input: JSON.stringify({ session_id: sid, transcript_path: fx.transcript }) }).stdout.trim();
+  assert.ok(go(fx.sessionId), "session A blocks once");
+  assert.ok(go(other), "session B under the same parent process blocks once too");
+  assert.equal(go(fx.sessionId), "", "A again: marker taken");
+  assert.ok(fs.existsSync(markerPath(fx.sessionId)));
+  assert.equal(runViaNewParent({ session_id: fx.sessionId, transcript_path: fx.transcript }, fx.dir), "", "resume of A from a new process: no re-fire");
+});
+
+function forkTranscript(fx, { parent = true, ownLore = false } = {}) {
+  const pid = `${fx.sessionId}-parent`;
+  const parentEntries = [toolUse("mcp__skyline__lore_mark", { body: "x" }), { type: "assistant", message: { content: [{ type: "text", text: "marked" }] } }];
+  const withUuid = (e, uuid, sid) => ({ ...e, uuid, sessionId: sid });
+  if (parent) fs.writeFileSync(path.join(fx.tmp, `${pid}.jsonl`), jsonl(parentEntries.map((e, i) => withUuid(e, `${pid}-u${i}`, pid))));
+  const own = [{ type: "user", message: { content: "Reply with exactly: ok" } }, ...(ownLore ? [toolUse("mcp__skyline__lore_supersede", { id: 1 })] : [])];
+  fs.writeFileSync(
+    fx.transcript,
+    jsonl([
+      { type: "derived-from", v: 1, sessionId: fx.sessionId, sessions: [{ type: "claude_code_session", id: pid, via: "fork" }] },
+      ...parentEntries.map((e, i) => withUuid(e, `${pid}-u${i}`, fx.sessionId)),
+      ...own.map((e, i) => withUuid(e, `${fx.sessionId}-own${i}`, fx.sessionId)),
+    ])
+  );
+}
+
+test("I3 fork: a lore_mark inherited from the fork parent does not answer the check; the fork's own lore call does; parent missing => counted as before", (t) => {
+  const inherited = qFixture(t, "fork-inh");
+  forkTranscript(inherited);
+  const r1 = runQ(inherited, qlrSess("fork-inh"));
+  assert.ok(r1.block && r1.block.decision === "block", "the parent's answer is not the fork's");
+  const own = qFixture(t, "fork-own");
+  forkTranscript(own, { ownLore: true });
+  assert.equal(runQ(own, qlrSess("fork-own")).out, "", "the fork's own lore_supersede answers it");
+  const orphan = qFixture(t, "fork-orphan");
+  forkTranscript(orphan, { parent: false });
+  assert.equal(runQ(orphan, qlrSess("fork-orphan")).out, "", "parent transcript missing: no scoping (pre-1.5.38 behaviour)");
 });

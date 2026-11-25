@@ -29,8 +29,9 @@
  *    debrief turn) pass silently instead of re-demanding the report (field
  *    case 2026-07-26: a haiku session's Stop-gate re-fired on a DEBRIEF turn
  *    after FINAL had already been given earlier that session — pure noise,
- *    burned tokens). Blocks at most MAX_BLOCKS times per session, then fails
- *    open so a wedged model cannot loop forever.
+ *    burned tokens). Blocks at most MAX_BLOCKS times per user turn (1.5.38;
+ *    per session before), then fails open so a wedged model cannot loop
+ *    forever (BLOCK BUDGET below).
  *
  * FINAL report file (1.5.35; operator: the FINAL block is for the LLM, not
  * for a human reading chat, so it is stored and chat gets one line):
@@ -82,6 +83,57 @@
  *    CHECKPOINT lines written live, before the FINAL write (see
  *    checkpointLiveness below); else field `checkpoint-not-live`.
  *
+ *
+ * 1.5.38 (audit of 1.5.37 against live Claude Code 2.1.332 sessions):
+ *  - MULTI-TURN (I1): a merit pass via the report file stores the
+ *    transcript's line count in `<tmpdir>/skyline-loop-gate-<sid>+pass`. The
+ *    C2 scan then ends at the first FINAL-marked write AT OR AFTER that
+ *    line. A FINAL write of an attempt that already passed neither ends the
+ *    scan nor counts as a live write (a line copied from the old FINAL is
+ *    not live). Within one attempt C2 is unchanged: blocked, append, rewrite
+ *    does not make a line live. A stored line past the transcript's end is
+ *    ignored.
+ *  - BLOCK BUDGET (I2): the counter is
+ *    `<tmpdir>/skyline-loop-gate-<sid>@<prompt_id>`, one per user turn
+ *    (Claude Code keeps prompt_id across a turn's block continuations).
+ *    Without a usable prompt_id it is the pre-1.5.38 session-wide
+ *    `skyline-loop-gate-<sid|ppid>`. A merit pass (chat text,
+ *    last_assistant_message or report file) deletes the current counter; a
+ *    fail-open never does. FAIL-OPEN, stated here and in the PR, never in a
+ *    block message (a block that advertises it invites stopping twice): the
+ *    (MAX_BLOCKS + 1)th Stop of a turn that is still unattested passes, so
+ *    after MAX_BLOCKS blocks the gate is advisory for the rest of that turn.
+ *    `@` and `+` are outside the sanitized-id alphabet, so these names never
+ *    equal another id's counter. A prompt_id that would push the name past
+ *    200 chars is replaced by `~<16 hex of its sha256>` (bounce 1 nit 6:
+ *    ENAMETOOLONG made the gate fail open from the first Stop). UNSCOPED
+ *    INHERITED SESSIONS (bounce 1 Minor 2): a fork or branch that carries a
+ *    marker or forkedFrom stamps but could not be scoped (parent unreadable)
+ *    keeps the 1.5.37 budget exactly: the session-wide counter, never reset,
+ *    so it is never blocked more often than 1.5.37 blocked it.
+ *  - FORKS (I3): every scan reads only this session's own entries
+ *    (transcript-scope.js scopeOf: entries inherited from a `--fork-session`
+ *    or `/branch` parent are skipped), so a fork never owes a FINAL for its
+ *    parent's build.
+ *  - PATH SPELLINGS (M1): a write names the report under any spelling of
+ *    its path: `~` (HOME, else USERPROFILE), `\` for `/`, `//`, `/./`,
+ *    `seg/..`, and letter case on win32 only. The literal and realpath forms
+ *    are matched as before.
+ *  - COMMITS (M5): a `git` argv or command counts when its subcommand, after
+ *    any number of global options (`-c k=v`, `-C dir`, `--no-pager`, ...),
+ *    is exactly `commit`; `git commit-graph`, `git log --grep commit` do not.
+ *    A shell separator (`;&|()<>`, newline) between `git` and the subcommand
+ *    breaks the match and is never an option value (prose: `use git (commit
+ *    early)`, `git -C\ncommit`). A quoted sub-command (`sh -c '...'`, `bash
+ *    -lc "..."`, `ssh h '...'`) and a backtick span are split and matched
+ *    again; `$'...'` is a quote (bounce 1 Minor 1, bounce 2 findings 2-4).
+ *    `echo "git commit"` matches, as it did before 1.5.38. THE CONTRACT is
+ *    the table in skyline-loop-gate.test.js ("commit matcher contract"),
+ *    including its known misses and known false positives.
+ *  - FLUSH RACE (M8): the Stop input's last_assistant_message also counts as
+ *    the chat FINAL when it passes every field check (skylore 669).
+ *  - Chat mode shares I2, I3, M5 and M8; I1 and the fields-missing labels
+ *    (I4) are file mode only.
  * Env:
  *  - SKYLINE_LOOP_REPORT = file (default, also any unknown value) | chat.
  *    chat = pre-1.5.35 behavior and messages (except the 1.5.36 not-emitted
@@ -96,9 +148,11 @@
  *
  * Fail-open on any stdin/transcript parse error, uncaught throw, or
  * unwritable block counter: exit 0, no output. A report file that does not
- * exist, fails a check, or cannot be read blocks (at most MAX_BLOCKS times).
+ * exist, fails a check, or cannot be read blocks (at most MAX_BLOCKS times
+ * per turn).
  */
 
+const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -111,6 +165,7 @@ const {
   reportPaths,
   sessionFileBase,
 } = require("./loop-report-path");
+const { scopeOf } = require("./transcript-scope");
 
 const MAX_BLOCKS = 2;
 
@@ -179,6 +234,21 @@ function missingFields(text) {
   return FIELD_CHECKS.filter(([, ok]) => !ok(t)).map(([key]) => key);
 }
 
+// I4 (1.5.38): a fields-missing block names the LABELS to write, with the key
+// in parentheses (a model wrote `slices: ...` for the key `slices`, which the
+// `slices shipped` check misses). Rule keys (coupling, naming, liveness) are
+// not labels and are named as they are; their notes explain them.
+const FIELD_LABELS = {
+  checkpoint: "`CHECKPOINT: <name> = done|skipped(<reason>)|n/a|not-emitted`",
+  deviations: "`deviations`",
+  slices: "`slices shipped`",
+  tests: "`test counts`",
+};
+
+function missingLabel(key) {
+  return Object.prototype.hasOwnProperty.call(FIELD_LABELS, key) ? `${FIELD_LABELS[key]} (${key})` : key;
+}
+
 // Report file limits (see header): MAX_REPORT_BYTES (256 KiB) and the
 // no-follow, non-blocking REPORT_OPEN_FLAGS come from loop-report-path.js, as
 // do retention (pruneReports, isLoopReport) and its constants.
@@ -237,14 +307,32 @@ function containsPath(s, p) {
   return false;
 }
 
-function checkpointLiveness(text, reportFile, reportText) {
-  const wanted = checkpointKeys(reportText);
-  if (!wanted.length) return { notLive: [], finalVisible: true };
-  const live = new Set();
-  let finalVisible = false;
-  // The same file under its resolved dir too (bounce 1 M1, skylore 676):
-  // skyline create answers with the realpath anchor (/tmp -> /private/tmp, a
-  // symlinked ~/.skylence), and the model's later edit appends carry it.
+// M1 (1.5.38): one spelling for every way of writing the same path, applied
+// to both sides before matching: `\` -> `/`, a `~` at a token start -> the
+// home dir (HOME, else USERPROFILE, as reportDir), `//` -> `/`, `/./` and
+// `seg/..` resolved, and letter case folded on win32 only.
+const IS_WIN32 = process.platform === "win32";
+
+function normPathText(s) {
+  let t = String(s).replace(/\\/g, "/");
+  const home = String(process.env.HOME || process.env.USERPROFILE || "")
+    .replace(/\\/g, "/")
+    .replace(/\/+$/, "");
+  if (home) t = t.replace(/(^|[\s"'`¶=(<>|;,])~(?=\/|$)/g, (_m, pre) => pre + home);
+  t = t.replace(/\/{2,}/g, "/");
+  let prev;
+  do {
+    prev = t;
+    t = t.replace(/\/\.(?=\/|$)/g, "").replace(/\/(?!\.\.?(?:\/|$))[^/\s"'`]+\/\.\.(?=\/|$)/g, "");
+  } while (t !== prev);
+  return IS_WIN32 ? t.toLowerCase() : t;
+}
+
+// The report path in every form a live write may carry: literal, realpath
+// (bounce 1 M1, skylore 676: skyline create answers with the realpath anchor,
+// /tmp -> /private/tmp or a symlinked ~/.skylence, and later edit appends
+// carry it), and both normalized (M1).
+function reportNames(reportFile) {
   const names = [reportFile];
   try {
     const real = path.join(fs.realpathSync(path.dirname(reportFile)), path.basename(reportFile));
@@ -252,7 +340,29 @@ function checkpointLiveness(text, reportFile, reportText) {
   } catch (_e) {
     /* dir missing or unreadable: the literal path only */
   }
-  forEachAssistantMessage(text, (content) => {
+  const norm = [...new Set(names.map((n) => normPathText(path.resolve(n))))];
+  const base = path.basename(reportFile);
+  return { names, norm, base: IS_WIN32 ? base.toLowerCase() : base };
+}
+
+function namesReport(s, r) {
+  if (r.names.some((p) => containsPath(s, p))) return true;
+  // Normalizing costs a few regex passes: only inputs naming the basename.
+  if (!(IS_WIN32 ? s.toLowerCase() : s).includes(r.base)) return false;
+  const t = normPathText(s);
+  return r.norm.some((p) => containsPath(t, p));
+}
+
+// anchor (I1, 1.5.38): index into `transcript`'s lines of the last merit
+// pass; a FINAL-marked write before it belongs to an attempt that already
+// passed, so it neither ends this scan nor counts as live.
+function checkpointLiveness(transcript, reportFile, reportText, anchor = 0) {
+  const wanted = checkpointKeys(reportText);
+  if (!wanted.length) return { notLive: [], finalVisible: true };
+  const live = new Set();
+  let finalVisible = false;
+  const r = reportNames(reportFile);
+  forEachAssistantMessage(transcript, (content, i) => {
     for (const block of content) {
       if (finalVisible) return;
       if (!block || typeof block !== "object") continue;
@@ -262,10 +372,11 @@ function checkpointLiveness(text, reportFile, reportText) {
         }
       } else if (block.type === "tool_use") {
         const s = inputStrings(block.input, [], 0).join("\n");
-        if (!names.some((p) => containsPath(s, p))) continue;
+        if (!namesReport(s, r)) continue;
         // The FINAL mark is looked for OUTSIDE CHECKPOINT lines: a reason
         // such as skipped(docs only, test counts unchanged) is not a FINAL.
         if (FINAL_WRITE_MARK.test(s.replace(CHECKPOINT_KEY_G, ""))) {
+          if (i < anchor) continue;
           finalVisible = true;
           return;
         }
@@ -321,21 +432,22 @@ function transcriptText(input) {
   }
 }
 
-// Parse the JSONL transcript once; invoke fn(contentBlocks) for every
-// assistant message. Shared by skillInvoked (looks for a Skill tool_use)
-// and attestationPresent (looks for a CHECKPOINT line in text blocks).
+// Parse the JSONL transcript (a string, or its lines already split) once;
+// invoke fn(contentBlocks, lineIndex) for every assistant message. Shared by
+// skillInvoked (looks for a Skill tool_use), attestationPresent (looks for a
+// CHECKPOINT line in text blocks) and checkpointLiveness (line order).
 function forEachAssistantMessage(text, fn) {
-  const lines = text.trim().split("\n");
-  for (const line of lines) {
+  const lines = Array.isArray(text) ? text : String(text).trim().split("\n");
+  for (let i = 0; i < lines.length; i += 1) {
     let entry;
     try {
-      entry = JSON.parse(line);
+      entry = JSON.parse(lines[i]);
     } catch (_e) {
       continue; // skip unparseable line
     }
     const msg = entry.message;
     if (entry.type === "assistant" && msg && Array.isArray(msg.content)) {
-      fn(msg.content);
+      fn(msg.content, i);
     }
   }
 }
@@ -366,12 +478,129 @@ function skillInvoked(text) {
 }
 
 // Commit-shaped: skyline git_commit tools, or a run/Bash call whose input
-// carries a git commit. Matched loosely on the transcript side too.
+// carries a git commit (M5, 1.5.38): an argv array, or a command string split
+// shell-style, in which `git` is followed by global options and then the
+// subcommand `commit` exactly. Matched the same way on the transcript side.
+const GIT_OPTS_WITH_VALUE = new Set(["-c", "-C", "--git-dir", "--work-tree", "--namespace", "--config-env", "--super-prefix"]);
+
+function isGitExe(tok) {
+  const b = String(tok).replace(/\\/g, "/").split("/").pop().toLowerCase();
+  return b === "git" || b === "git.exe";
+}
+
+// A shell command separator inside a token stream (shellTokens): `git` and
+// its subcommand never span one (`use git (commit early)`, `git\ncommit`).
+const SEP = null;
+
+function argvCommits(tokens) {
+  for (let i = 0; i < tokens.length; i += 1) {
+    if (tokens[i] === SEP || !isGitExe(tokens[i])) continue;
+    let j = i + 1;
+    for (; j < tokens.length; j += 1) {
+      if (tokens[j] === SEP) break;
+      const t = String(tokens[j]);
+      if (GIT_OPTS_WITH_VALUE.has(t)) {
+        if (tokens[j + 1] === SEP) break; // a separator is never an option value
+        j += 1;
+        continue;
+      }
+      if (t.startsWith("-")) continue;
+      if (t === "commit") return true;
+      break;
+    }
+    // Every git token in (i, j) was an option value, so a scan from it ends at
+    // the same j with the same answer: resume at j (linear, not quadratic).
+    i = Math.max(i, j - 1);
+  }
+  return false;
+}
+
+// Quote-aware split: whitespace ends a token; a command separator or
+// redirection (`; & | ( ) < >`, newline) ends it and adds SEP. `$'...'` is a
+// quote. A backtick substitution stays part of its word (`git -C \`pwd\`
+// commit`) and its text is split again after a SEP.
+function shellTokens(s) {
+  const out = [];
+  const subs = [];
+  let cur = "";
+  let quote = null;
+  let quoted = false;
+  const flush = () => {
+    if (cur || quoted) out.push(cur);
+    cur = "";
+    quoted = false;
+  };
+  const sep = () => {
+    flush();
+    if (out.length && out[out.length - 1] !== SEP) out.push(SEP);
+  };
+  for (let k = 0; k < s.length; k += 1) {
+    const ch = s[k];
+    if (quote) {
+      if (ch === quote) quote = null;
+      else cur += ch;
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+      quoted = true;
+    } else if (ch === "$" && s[k + 1] === "'") {
+      quote = "'";
+      quoted = true;
+      k += 1;
+    } else if (ch === "`") {
+      const end = s.indexOf("`", k + 1);
+      if (end === -1) {
+        sep();
+      } else {
+        subs.push(s.slice(k + 1, end));
+        cur += "``"; // placeholder: the span's text is matched once, below, never re-split per depth
+        k = end;
+      }
+    } else if (/[;&|()<>\n]/.test(ch)) {
+      sep();
+    } else if (/\s/.test(ch)) {
+      flush();
+    } else {
+      cur += ch;
+    }
+  }
+  flush();
+  for (const sub of subs) {
+    if (out.length && out[out.length - 1] !== SEP) out.push(SEP);
+    for (const t of shellTokens(sub)) out.push(t); // no spread: a 1 MB span overflows the argument limit
+  }
+  return out;
+}
+
+// A quoted sub-command (`sh -c '...'`, `bash -lc "..."`, `ssh h '...'`) is
+// one token: it is split and matched again (bounce 1 Minor 1), bounded by
+// MAX_INPUT_DEPTH like the object walk.
+function commitInValue(v, depth) {
+  if (typeof v === "string") {
+    if (!v.includes("commit")) return false;
+    const toks = shellTokens(v);
+    return (
+      argvCommits(toks) ||
+      (depth < MAX_INPUT_DEPTH && toks.some((t) => t !== SEP && /\s/.test(t) && commitInValue(t, depth + 1)))
+    );
+  }
+  if (!v || typeof v !== "object" || depth >= MAX_INPUT_DEPTH) return false;
+  if (Array.isArray(v) && v.every((x) => typeof x === "string") && argvCommits(v)) return true;
+  for (const x of Object.values(v)) if (commitInValue(x, depth + 1)) return true;
+  return false;
+}
+
 function isCommitCall(toolName, toolInput) {
   const name = String(toolName || "");
   if (/git_commit$/.test(name)) return true;
-  const asText = JSON.stringify(toolInput || {});
-  return /"git"\s*,\s*"commit"|git commit/.test(asText);
+  // Cheap pre-check first (commit mode runs it on every run/Bash call).
+  let asText;
+  try {
+    asText = JSON.stringify(toolInput || {});
+  } catch (_e) {
+    return false;
+  }
+  if (!asText || !asText.includes("commit")) return false;
+  return commitInValue(toolInput, 0);
 }
 
 // (a) commit-activity check: same real-tool_use discipline as
@@ -447,9 +676,20 @@ function chatSoftNote(text) {
 // is what it always was.
 const sanitizeSessionId = sessionFileBase;
 
-function blockCountFile(input) {
+const MAX_COUNTER_NAME = 200;
+
+// perTurn false (an unscoped inherited session, bounce 1 Minor 2): the
+// pre-1.5.38 session-wide counter, whatever prompt_id says.
+function blockCountFile(input, perTurn = true) {
   const sid = sanitizeSessionId(input.session_id ? String(input.session_id) : "");
-  return path.join(os.tmpdir(), `skyline-loop-gate-${sid || process.ppid}`);
+  const base = `skyline-loop-gate-${sid || process.ppid}`;
+  // I2 (1.5.38): one budget per user turn when the Stop input names it.
+  const raw = perTurn && typeof input.prompt_id === "string" ? input.prompt_id : null;
+  let turn = raw === null ? null : sanitizeSessionId(raw);
+  if (turn && base.length + 1 + turn.length > MAX_COUNTER_NAME) {
+    turn = `~${crypto.createHash("sha256").update(raw).digest("hex").slice(0, 16)}`;
+  }
+  return path.join(os.tmpdir(), turn ? `${base}@${turn}` : base);
 }
 
 // Returns the new count, or null when it could not be persisted: a counter
@@ -469,6 +709,51 @@ function bumpBlockCount(file) {
     return null;
   }
   return n;
+}
+
+// I2: a merit pass resets this turn's budget; a fail-open never calls this.
+function clearBlockCount(input) {
+  try {
+    fs.rmSync(blockCountFile(input), { force: true });
+  } catch (_e) {
+    /* best-effort */
+  }
+}
+
+// I1 (1.5.38): transcript line count at the last merit pass via the report
+// file. Keyed by the sanitized session id only (null without one: file mode
+// has no report path then either).
+function passFile(input) {
+  const sid = sanitizeSessionId(input.session_id ? String(input.session_id) : "");
+  return sid ? path.join(os.tmpdir(), `skyline-loop-gate-${sid}+pass`) : null;
+}
+
+function readPassLine(input) {
+  const f = passFile(input);
+  if (!f) return 0;
+  try {
+    const n = parseInt(fs.readFileSync(f, "utf8"), 10);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  } catch (_e) {
+    return 0;
+  }
+}
+
+function savePassLine(input, n) {
+  const f = passFile(input);
+  if (!f) return;
+  try {
+    fs.writeFileSync(f, String(n));
+  } catch (_e) {
+    /* best-effort: without it the next attempt is anchored as before */
+  }
+}
+
+// M8 (1.5.38): the Stop input carries the turn's final text, which the
+// transcript may not hold yet (skylore 669).
+function lastMessageAttests(input) {
+  const m = input.last_assistant_message;
+  return typeof m === "string" && m !== "" && missingFields(m).length === 0;
 }
 
 // FINAL report path for this session (loop-report-path.js: file mode only,
@@ -494,7 +779,7 @@ function unreadable(e) {
 // state blocks (bounded by MAX_BLOCKS) and the block message says why;
 // "unreadable" is an fs error other than absence (EACCES on the file or its
 // dir, a failing read) and its message also accepts a FINAL in chat.
-function checkReportFile(p, transcript) {
+function checkReportFile(p, transcript, anchor = 0) {
   let st;
   try {
     st = fs.lstatSync(p);
@@ -533,7 +818,7 @@ function checkReportFile(p, transcript) {
     // C2 liveness, only when the caller hands the transcript (the Stop path);
     // the key is appended after the field-table keys.
     if (transcript !== undefined) {
-      const { notLive, finalVisible } = checkpointLiveness(transcript, p, reportText);
+      const { notLive, finalVisible } = checkpointLiveness(transcript, p, reportText, anchor);
       if (notLive.length) {
         missing.push(LIVE_KEY);
         note += liveNote(notLive, finalVisible);
@@ -587,7 +872,7 @@ function fileStopMessage(reportFile, report) {
       problem = ` The report file ${at} could not be read (${report.code}); fix the path or its permissions, or print the full FINAL in chat instead (the gate accepts either).`;
       break;
     case "fields-missing":
-      problem = ` The report file ${at} is missing fields: ${report.missing.join(", ")}.${report.note || ""}`;
+      problem = ` The report file ${at} is missing fields: ${report.missing.map(missingLabel).join(", ")}.${report.note || ""}`;
       break;
     default:
       break; // absent: the instruction below names the path
@@ -595,7 +880,7 @@ function fileStopMessage(reportFile, report) {
   return (
     "feature-loop-skill FINAL attestation missing." +
     problem +
-    ` Before ending: write the mandatory FINAL report to ${at} with the skyline create tool (overwrite:true if it exists) keeping the CHECKPOINT lines already in it verbatim, then print only \`FINAL stored: ${reportFile}\` plus at most 2 short lines in chat; the report goes in the file, not in chat. A CHECKPOINT line counts as live only when an earlier tool call of its own appended it to this file (or it was printed in chat at the time). The report must carry: ` +
+    ` Before ending: write the mandatory FINAL report to ${at} with the skyline create tool (overwrite:true if it exists) keeping the CHECKPOINT lines already in it verbatim (append the \`skylore:\` line, or include it in the FINAL you write), then print only \`FINAL stored: ${reportFile}\` plus at most 2 short lines in chat; the report goes in the file, not in chat. Pausing mid-build => write an interim FINAL (slices so far); keep appending CHECKPOINT lines and rewrite the FINAL when done. A CHECKPOINT line counts as live only when an earlier tool call of its own appended it to this file (or it was printed in chat at the time). The report must carry: ` +
     FINAL_FIELDS_DEMAND
   );
 }
@@ -614,7 +899,17 @@ function main() {
     process.exit(0);
   }
   const text = transcriptText(input);
-  if (!text || !skillInvoked(text)) process.exit(0);
+  if (!text) process.exit(0);
+  // I3 (1.5.38): this session's own entries only; a fork's or branch's
+  // inherited parent history (Skill, commits, FINAL) is skipped.
+  const all = text.trim().split("\n");
+  const scope = scopeOf(all, input.transcript_path);
+  const from = scope.start;
+  const own = from ? all.slice(from) : all;
+  // Bounce 1 Minor 2: inherited but not scoped => the 1.5.37 budget (one
+  // session-wide counter, never reset), never the per-turn one.
+  const perTurn = !(scope.inherited && from === 0);
+  if (!skillInvoked(own)) process.exit(0);
 
   if (mode === "commit") {
     const reportFile = reportPath(input);
@@ -631,29 +926,38 @@ function main() {
 
   if (mode === "stop") {
     // (a) Only gate sessions that actually built something this session.
-    if (!commitActivityInTranscript(text)) process.exit(0);
+    if (!commitActivityInTranscript(own)) process.exit(0);
     // (b) FINAL already given earlier this session: later Stops pass silently.
-    //     Legacy text path first: it needs no fs and holds in both modes.
-    if (attestationPresent(text)) process.exit(0);
-    // (b') File mode: FINAL written to this session's report file.
+    //     Legacy text path first: it needs no fs and holds in both modes;
+    //     the Stop input's last_assistant_message counts too (M8).
+    if (attestationPresent(own) || lastMessageAttests(input)) {
+      if (perTurn) clearBlockCount(input);
+      process.exit(0);
+    }
+    // (b') File mode: FINAL written to this session's report file, its
+    //      liveness scan anchored at the last merit pass (I1).
     const reportFile = reportPath(input);
     let report = null;
     if (reportFile) {
-      report = checkReportFile(reportFile, text);
+      const passAt = readPassLine(input);
+      const anchor = passAt > from && passAt <= all.length ? passAt - from : 0;
+      report = checkReportFile(reportFile, own, anchor);
       if (report.state === "ok") {
+        savePassLine(input, all.length);
+        if (perTurn) clearBlockCount(input);
         pruneReports(path.dirname(reportFile), currentSessionNames(input, reportFile));
         process.exit(0);
       }
     }
     // (c) Genuine in-build stop, no attestation ever emitted: keep blocking.
-    const n = bumpBlockCount(blockCountFile(input));
-    // Fail-open, never wedge a session: past MAX_BLOCKS, or when the counter
-    // cannot be persisted (it would never reach MAX_BLOCKS).
+    const n = bumpBlockCount(blockCountFile(input, perTurn));
+    // Fail-open, never wedge a session: past MAX_BLOCKS in this turn, or when
+    // the counter cannot be persisted (it would never reach MAX_BLOCKS).
     if (n === null || n > MAX_BLOCKS) process.exit(0);
     const base = reportFile ? fileStopMessage(reportFile, report) : LEGACY_STOP_MESSAGE;
     // The chat note only when no report-file problem is listed beside it
     // (null = chat mode / no path, absent = nothing written yet).
-    const chatNote = !report || report.state === "absent" ? chatSoftNote(text) : "";
+    const chatNote = !report || report.state === "absent" ? chatSoftNote(own) : "";
     process.stderr.write(chatNote && !base.includes(chatNote) ? base + chatNote : base);
     process.exit(2);
   }
@@ -672,5 +976,5 @@ if (require.main === module) {
     process.exit(0);
   }
 } else {
-  module.exports = { checkReportFile, isLoopReport, missingFields, sanitizeSessionId, MAX_REPORT_BYTES };
+  module.exports = { checkReportFile, isCommitCall, isLoopReport, missingFields, sanitizeSessionId, MAX_REPORT_BYTES };
 }
