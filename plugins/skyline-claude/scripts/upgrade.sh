@@ -33,8 +33,9 @@
 # The log and summary live in ${XDG_CACHE_HOME:-$HOME/.cache}/skyline/
 # (upgrade.log, upgrade-summary.txt), or in ${TMPDIR:-/tmp} (skyline-
 # prefixed) when that cannot be written; their paths are printed first. A
-# previous run's log and summary there are removed first. Overlapping runs
-# share the log and the summary (the later write wins), never a step file.
+# previous run's log there is removed first; its summary stays until this
+# run's first summary replaces it, so the file is never missing. Overlapping
+# runs share the log and the summary (the later write wins), never a step file.
 # Writes to them are best effort and never change the outcome or the exit
 # code. Keep the body POSIX sh (the test runs it under bash, sh and dash).
 
@@ -91,13 +92,16 @@ write_progress() {
   put_summary "$(started_text)${NL}Last step started: $last_started${NL}Last step finished: $last_finished"
 }
 
-# use_dir <dir> <prefix>: this run's log, summary and step file in <dir>. A
-# previous run's log and summary go first: one this user cannot rewrite (mode
-# 0444, or another user's) would otherwise send this run to the fallback
-# directory and leave that run's "Upgrade complete." at this path.
+# use_dir <dir> <prefix>: this run's log, summary and step file in <dir>.
+# A previous run's log goes first: one this user cannot rewrite (mode 0444, or
+# another user's) would otherwise send this run to the fallback directory and
+# leave that run's "Upgrade complete." at this path. Its summary is replaced
+# by the rename in put_summary (which works over such a file too), so a reader
+# never finds the file missing. When <dir> cannot be used after all, the
+# previous summary is removed, never left behind as if it were this run's.
 use_dir() {
   mkdir -p "$1" 2>/dev/null || return 1
-  rm -f "$1/${2}upgrade.log" "$1/${2}upgrade-summary.txt" 2>/dev/null
+  rm -f "$1/${2}upgrade.log" 2>/dev/null
   LOG="$1/${2}upgrade.log"
   SUMMARY="$1/${2}upgrade-summary.txt"
   SUMTMP="$1/${2}upgrade-write.$$.tmp"
@@ -105,7 +109,7 @@ use_dir() {
   if printf '' 2>/dev/null >"$LOG" && printf '' 2>/dev/null >"$STEP" && write_progress; then
     return 0
   fi
-  rm -f "$STEP" 2>/dev/null
+  rm -f "$STEP" "$SUMMARY" 2>/dev/null
   return 1
 }
 if use_dir "${XDG_CACHE_HOME:-$HOME/.cache}/skyline" ""; then

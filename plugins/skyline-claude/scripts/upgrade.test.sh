@@ -231,7 +231,9 @@ EOF
 #   stale=1 (a previous run's "Upgrade complete." summary is in place),
 #   f444=1 (a previous run's summary and log, both mode 0444), ro=1 (the
 #   cache dir is read-only during the run, so the files go to TMPDIR),
-#   snap=1 (the fake setup hard-links the summary file to state/snap).
+#   snap=1 (the fake setup hard-links the summary file to state/snap),
+#   mv=fail (every mv fails) | mv=spy (each mv records in state/mvlog whether
+#   its target existed, then runs the real mv).
 run_case() {
   SH="$1"; CASE="$2"; shift 2
   DIR="$ROOT/$SH-$CASE"
@@ -275,6 +277,14 @@ run_case() {
       ro)
         RO=1; SUMF="$DIR/tmp/skyline-upgrade-summary.txt"; LOGF="$DIR/tmp/skyline-upgrade.log" ;;
       snap) SNAP=1 ;;
+      mv)
+        if [ "$v" = fail ]; then
+          printf '#!/bin/sh\nexit 1\n' >"$DIR/bin/mv"
+        else
+          printf '#!/bin/sh\nif [ -e "$3" ]; then echo present; else echo absent; fi >>"$FAKE_STATE/mvlog"\nexec "%s" "$@"\n' \
+            "$TOOLS/mv" >"$DIR/bin/mv"
+        fi
+        chmod +x "$DIR/bin/mv" ;;
       *) echo "$v" >"$STATE/$k" ;;
     esac
   done
@@ -684,6 +694,31 @@ for SHELL_UNDER_TEST in $SHELLS; do
   cache_clean "$DIR/home/.cache/skyline"
 
   # --- a previous run's files (review M2) --------------------------------------
+  # The previous summary stays until this run's first summary replaces it by
+  # a rename, so a reader never finds the file missing (the mv spy sees the
+  # target in place).
+  run_case "$S" stale-replaced mode=npm stale=1 mv=spy
+  rc_is 0
+  summary_ok
+  if [ "$(head -n 1 "$STATE/mvlog" 2>/dev/null)" = present ]; then
+    ok
+  else
+    bad "the previous summary was gone before this run's first summary replaced it: [$(tr '\n' ' ' <"$STATE/mvlog" 2>/dev/null)]"
+  fi
+  # No summary can be written anywhere (every mv fails): the previous run's
+  # "Upgrade complete." is removed, never left at the documented path. The
+  # outcome and the exit code are unchanged.
+  run_case "$S" stale-mv-fails mode=npm stale=1 mv=fail
+  rc_is 0
+  has "no writable directory for the summary and log files"
+  last_is "Upgrade complete."
+  if [ -e "$DIR/home/.cache/skyline/upgrade-summary.txt" ]; then
+    bad "a previous run's summary was left at the documented path"
+  else
+    ok
+  fi
+  left=$(ls -A "$DIR/home/.cache/skyline" "$DIR/tmp" 2>/dev/null | grep -e 'upgrade-step\.' -e 'upgrade-write\.' | tr '\n' ' ')
+  if [ -z "$left" ]; then ok; else bad "left behind: $left"; fi
   # Its summary and log are mode 0444: they are removed, and this run's
   # summary is at the documented path.
   run_case "$S" stale-f444 mode=npm f444=1
