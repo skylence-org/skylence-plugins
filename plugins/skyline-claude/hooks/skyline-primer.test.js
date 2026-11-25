@@ -30,6 +30,10 @@ function run(input, env = {}) {
       ...process.env,
       SKYLORE_DB: path.join(os.tmpdir(), "primer-no-such-bank.db"),
       CLAUDE_CONFIG_DIR: path.join(os.tmpdir(), "primer-no-such-claude-dir"),
+      // 1.5.40: no daemon probe by default, so these tests never touch the
+      // live daemon on 127.0.0.1:7333 and their output does not depend on
+      // whether one runs. skyline-primer-daemon.test.js covers the probe.
+      SKYLINE_PRIMER_NO_DAEMON_CHECK: "1",
       ...env,
     },
   });
@@ -111,6 +115,7 @@ test("malformed stdin exits 0 empty", () => {
   const res = spawnSync(process.execPath, [HOOK], {
     encoding: "utf8",
     input: "{ not json",
+    env: { ...process.env, SKYLINE_PRIMER_NO_DAEMON_CHECK: "1" },
   });
   assert.equal(res.status, 0);
   assert.equal(res.stdout.trim(), "");
@@ -528,6 +533,7 @@ function runEnv(input, env, hook = HOOK) {
     ...base,
     SKYLORE_DB: path.join(os.tmpdir(), "primer-no-such-bank.db"),
     CLAUDE_CONFIG_DIR: path.join(os.tmpdir(), "primer-no-such-claude-dir"),
+    SKYLINE_PRIMER_NO_DAEMON_CHECK: "1", // never probe the live :7333 (see run())
     ...env,
   };
   for (const [k, v] of Object.entries(merged)) if (v === undefined) delete merged[k];

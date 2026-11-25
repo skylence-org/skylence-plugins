@@ -5,12 +5,15 @@
  * Emits ONLY additionalContext on SessionStart hook (no permission decision).
  * 1.5.37: in loop-report file mode also names this session's three loop
  * report files (loopReportBlock), on every SessionStart source.
+ * 1.5.40: one bounded daemon probe adds a one-line hint when no skyline
+ * daemon answers (probeDaemon); SKYLINE_PRIMER_NO_DAEMON_CHECK=1 skips it.
  * Fail-open on any error/parse/fs: exit 0, no output.
  */
 
 const fs = require("fs");
 const path = require("path");
 const { spawnSync } = require("child_process");
+const http = require("http");
 
 function hasMarker(cwd, name) {
   if (!cwd) return false;
@@ -304,6 +307,106 @@ function pruneOldReports(sessionId) {
     /* best-effort */
   }
 }
+// 1.5.40 (binary-skyline#1121 group B): a plugin-only user never runs the
+// binary, and the MCP server is just a URL, so nothing tells the model when
+// no daemon is there. ONE GET /health per SessionStart, hard 300 ms deadline
+// (a real timer that destroys the request, not the idle `timeout` option),
+// `agent: false` so an env proxy never sees it, no Authorization header.
+// Outcomes (orchestrator ruling on the lane, 2026-11-25):
+//   answered    - a complete status line + headers, any status: no hint,
+//                 output byte-identical to the probe-less primer.
+//   unreachable - refused, reset before any byte, DNS failure, or no
+//                 connection by the deadline: hint to run `skyline setup`.
+//   unanswered  - connected (or bytes arrived) but no complete response by
+//                 the deadline, or bytes then an error: a different hint
+//                 pointing at `skyline daemon status` (a busy daemon must not
+//                 be told to re-run setup).
+//   throw       - the probe could not run: caller prints today's output.
+// SKYLINE_PRIMER_NO_DAEMON_CHECK=1 skips the probe (no socket is opened).
+const DAEMON_PROBE_DEADLINE_MS = 300;
+
+// Same derivation as skyline-enforce.js DAEMON_HOST / DAEMON_PORT: trimmed,
+// default 127.0.0.1:7333, exact `[::1]` unbracketed for the connect.
+function daemonTarget() {
+  const host =
+    ((process.env.SKYLINE_DAEMON_HOST || "").trim() || "127.0.0.1").replace(/^\[::1\]$/, "::1");
+  const port = Number(process.env.SKYLINE_DAEMON_PORT || 7333);
+  return { host, port };
+}
+
+function probeDaemon(host, port, done) {
+  let settled = false;
+  let connected = false;
+  let sock = null;
+  let req = null;
+  const gotBytes = () => Boolean(sock && sock.bytesRead > 0);
+  const finish = (outcome) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(deadline);
+    try {
+      if (req) req.destroy();
+    } catch (_e) {
+      /* already gone */
+    }
+    done(outcome);
+  };
+  const deadline = setTimeout(
+    () => finish(connected || gotBytes() ? "unanswered" : "unreachable"),
+    DAEMON_PROBE_DEADLINE_MS
+  );
+  try {
+    req = http.get({ host, port, path: "/health", agent: false }, (res) => {
+      try {
+        res.destroy();
+      } catch (_e) {
+        /* already gone */
+      }
+      finish("answered");
+    });
+  } catch (e) {
+    settled = true;
+    clearTimeout(deadline);
+    throw e;
+  }
+  req.on("socket", (s) => {
+    sock = s;
+    s.once("connect", () => {
+      connected = true;
+    });
+  });
+  req.on("error", () => finish(gotBytes() ? "unanswered" : "unreachable"));
+}
+
+// host:port as the user would type it; the host comes from the environment,
+// so control characters are stripped and the length is capped.
+function daemonAddress(host, port) {
+  const clean = String(host).replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 100);
+  const shown = clean.includes(":") && !clean.startsWith("[") ? "[" + clean + "]" : clean;
+  return shown + ":" + port;
+}
+
+function daemonHint(outcome, host, port) {
+  const addr = daemonAddress(host, port);
+  if (outcome === "unreachable") {
+    return (
+      "The skyline daemon is not reachable on " + addr +
+      " (SessionStart probe got no connection), so the skyline MCP tools will fail this session. " +
+      "Tell the user to run `skyline setup` (installs and starts the daemon service), or to start it with `skyline daemon start --port " +
+      port + "`."
+    );
+  }
+  if (outcome === "unanswered") {
+    return (
+      "Something accepted a connection on " + addr +
+      " but sent no complete HTTP response within " + DAEMON_PROBE_DEADLINE_MS +
+      " ms (SessionStart probe), so the skyline daemon may be busy or stuck and skyline MCP tools may fail. " +
+      "If they do, tell the user to check it with `skyline daemon status`."
+    );
+  }
+  return "";
+}
+
 let buf = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (d) => (buf += d));
@@ -379,15 +482,51 @@ process.stdin.on("end", () => {
   if (reportBlock) {
     parts.push(reportBlock);
   }
-  context = parts.join("\n\n");
+  // 1.5.40 (binary-skyline#1121): one bounded daemon probe. Its hint, when
+  // there is one, is its own part right after FOCUS_LICENSE (the front-loaded
+  // environment facts), so the context still starts with ABS_PATH_FACT.
+  emitWithDaemonCheck(parts);
+});
 
-  process.stdout.write(
+function writeContext(parts, exitAfter) {
+  const out =
     JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "SessionStart",
-        additionalContext: context,
+        additionalContext: parts.join("\n\n"),
       },
-    }) + "\n"
-  );
-  // Natural exit flushes async Windows pipe writes (see skyline-regate.js).
-});
+    }) + "\n";
+  if (!exitAfter) {
+    process.stdout.write(out);
+    // Natural exit flushes async Windows pipe writes (see skyline-regate.js).
+    return;
+  }
+  // A started probe can leave a DNS lookup in flight that destroy() does not
+  // cancel (a hostname in SKYLINE_DAEMON_HOST). Exit once the write has
+  // flushed, so that lookup can never hold SessionStart open.
+  process.stdout.write(out, () => process.exit(0));
+}
+
+function emitWithDaemonCheck(parts) {
+  if (process.env.SKYLINE_PRIMER_NO_DAEMON_CHECK === "1") {
+    writeContext(parts, false);
+    return;
+  }
+  let target;
+  try {
+    target = daemonTarget();
+    probeDaemon(target.host, target.port, (outcome) => {
+      let hint = "";
+      try {
+        hint = daemonHint(outcome, target.host, target.port);
+      } catch (_e) {
+        hint = "";
+      }
+      writeContext(hint ? [...parts.slice(0, 2), hint, ...parts.slice(2)] : parts, true);
+    });
+  } catch (_e) {
+    // (d) the probe could not run (bad port, invalid host characters, any
+    // exception): exactly today's output, no hint.
+    writeContext(parts, false);
+  }
+}

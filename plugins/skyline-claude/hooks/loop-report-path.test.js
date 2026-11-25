@@ -163,7 +163,13 @@ test("Q1: primer-injected paths equal the gate's paths for a UUID, a/b and a 300
       message: { content: [{ type: "tool_use", name: "Skill", input: { skill: "feature-loop-skill" } }] },
     }) + "\n"
   );
-  const env = { ...process.env, SKYLINE_LOOP_REPORT_DIR: reports, SKYLORE_DB: path.join(dir, "no-bank.db") };
+  // SKYLINE_PRIMER_NO_DAEMON_CHECK: the primer must not probe the live :7333.
+  const env = {
+    ...process.env,
+    SKYLINE_LOOP_REPORT_DIR: reports,
+    SKYLORE_DB: path.join(dir, "no-bank.db"),
+    SKYLINE_PRIMER_NO_DAEMON_CHECK: "1",
+  };
   delete env.SKYLINE_LOOP_REPORT;
   const spawnHook = (file, args, input) => {
     const res = spawnSync(process.execPath, [path.resolve(__dirname, file), ...args], {
