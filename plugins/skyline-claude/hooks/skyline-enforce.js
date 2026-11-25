@@ -48,7 +48,7 @@ const MODE = process.argv[2] || "";
 // loopback check and the connection can never disagree about the host (a
 // padded " localhost" would otherwise pass the check yet reach the resolver
 // as-is; an empty host would make http.get connect to its implicit localhost).
-const DAEMON_HOST = ((process.env.SKYLINE_DAEMON_HOST || "").trim() || "127.0.0.1").replace(/^\[(.*)\]$/, "$1");
+const DAEMON_HOST = ((process.env.SKYLINE_DAEMON_HOST || "").trim() || "127.0.0.1").replace(/^\[::1\]$/, "::1");
 const DAEMON_PORT = Number(process.env.SKYLINE_DAEMON_PORT || 7333);
 const DAEMON_TIMEOUT = 500;
 // Cap on the /health body the guard will parse (the real body is ~100 bytes).
@@ -730,7 +730,7 @@ function daemonBearer() {
 // this comparison and the connection cannot disagree.
 function isLoopbackHost(host) {
   const h = String(host).toLowerCase();
-  return h === "127.0.0.1" || h === "::1" || h === "[::1]" || h === "localhost";
+  return h === "127.0.0.1" || h === "::1" || h === "localhost";
 }
 
 // DAEMON-READY GUARD (skylence-plugins#53). Two concurrent GETs under ONE hard
@@ -761,12 +761,15 @@ function isLoopbackHost(host) {
 //               Only `maintenance_locked === true` (<= 1.2.x) is trusted as
 //               "answers but refuses every tool call"; it is already
 //               qualified by gate_active on the daemon side.
+//               `refusing_tools === true` (binary-skyline >= 1.4.0; `refusal`
+//               labels the kind) is trusted too: it comes from the same
+//               gate_verdict call_tool enforces.
 //
 // NOT used, on purpose: the `acceptance` (<= 1.2.x) and `account` (1.3.x)
 // labels. The daemon reports them on dev builds too, which serve every call,
 // and /health carries no gate_active, so failing open on them would switch
-// enforcement off on healthy daemons. The admin kill-switch and FreeCap are not
-// in /health at all. Those refusals stay uncovered rather than guessed at.
+// enforcement off on healthy daemons. Daemons <= 1.3.x expose no refusal
+// signal; those refusals stay uncovered rather than guessed at.
 //
 // Anything /health says that is not a clean JSON object within
 // HEALTH_MAX_BYTES (error status, hang, oversized, wrong shape) means "no

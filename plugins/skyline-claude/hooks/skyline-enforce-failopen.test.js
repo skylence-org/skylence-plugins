@@ -376,6 +376,12 @@ test("nothing listening: unchanged fail-open, exact legacy wording", async () =>
   assert.match(r.stderr, /skyline daemon unreachable/);
   assert.match(r.stderr, /allowing native tool/);
   assert.equal(r.stdout, "");
+  // A refused connection fails open at once, not at the deadline (relative bound, load-proof).
+  let hangMs;
+  await withDaemon({ mcp: HANG }, async (h) => {
+    hangMs = (await runHook("read", h.port, CALLS.Read.input)).ms;
+  });
+  assert.ok(r.ms < hangMs - 250, `refused: ${r.ms}ms vs ${hangMs}ms when /mcp hangs to the deadline`);
 });
 
 test("/mcp that never answers: unchanged fail-open as unreachable, bounded by the deadline", async () => {
@@ -713,7 +719,7 @@ for (const kind of ["subscription", "kill_switch", "free_cap"]) {
 }
 
 test("refusing_tools:true with a junk refusal label: one line, the label is never echoed", async () => {
-  for (const junk of ['"Sub\\u001b[31mX"', '"' + "a".repeat(80) + '"', "7", "null", "{}"]) {
+  for (const junk of ['"Sub\\u001b[31mX"', '"' + "a".repeat(80) + '"', "7", "null", "{}", '"subscription\\nX"', '"Subscription"']) {
     const body = `{"status":"ok","refusing_tools":true,"refusal":${junk}}`;
     await withDaemon({ mcp: 406, health: body }, async (d) => {
       const r = await runHook("read", d.port, CALLS.Read.input);
@@ -797,6 +803,17 @@ test("token + host [::1] (bracketed): connects, bearer sent to /mcp only, health
   }
 });
 
+
+test("bracketed spellings other than [::1] are not normalized: no bearer leaves, the hook fails open as before", async () => {
+  for (const host of ["[127.0.0.1]", "[localhost]", "[LOCALHOST]", "[]", "[[::1]]"]) {
+    await withDaemon({ mcp: 406, token: TOKEN }, async (d) => {
+      const r = await runHook("read", d.port, CALLS.Read.input, { SKYLINE_DAEMON_TOKEN: TOKEN, SKYLINE_DAEMON_HOST: host });
+      assertNoTokenLeak(host, r, TOKEN);
+      const withAuth = [...onPath(d, "/mcp"), ...onPath(d, "/health")].filter((a) => a.authorization !== undefined);
+      assert.equal(withAuth.length, 0, `${host}: no request carried Authorization`);
+    });
+  }
+});
 // --- m1: the ONE hard deadline is load-bearing -----------------------------------
 // The http `timeout` option is idle-only: a /health that keeps trickling bytes
 // never goes idle, so only the hard DAEMON_TIMEOUT deadline bounds the hook.
