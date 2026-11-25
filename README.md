@@ -129,7 +129,11 @@ MCP tools should include `skyline_read`, `skyline_grep`, `skyline_edit`,
 
 - **Grok**: use `/skyline-grok:upgrade`, `/skyline-grok:uninstall` (or the
   equivalent for skybox/skycastle/skyway).
-- **Claude**: run `/upgrade` or `/uninstall` from the installed plugin.
+- **Claude**: run `/upgrade` or `/uninstall` from the installed plugin. The
+  skyline-claude upgrade updates the binary, runs `skyline setup`, restarts the
+  daemon, and ends with a summary of what changed (non-zero exit on failure).
+  The summary is also written to `~/.cache/skyline/upgrade-summary.txt`, for
+  when the daemon restart cuts the calling session's output short.
 - **Codex**: ask for the upgrade or uninstall skill.
 
 Manual removal commands are printed by the uninstall flow. Package removal uses
