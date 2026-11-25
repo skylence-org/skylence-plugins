@@ -52,7 +52,7 @@ function sandbox(t) {
   return { cwd, home };
 }
 
-function runPrimer(box, env = {}, rawInput) {
+function runPrimer(box, env = {}, rawInput, hook = HOOK) {
   const base = { ...process.env };
   for (const k of [
     "SKYLINE_LOOP_REPORT",
@@ -79,7 +79,7 @@ function runPrimer(box, env = {}, rawInput) {
   for (const [k, v] of Object.entries(merged)) if (v === undefined) delete merged[k];
   const t0 = process.hrtime.bigint();
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [HOOK], { env: merged });
+    const child = spawn(process.execPath, [hook], { env: merged });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (d) => (stdout += d));
@@ -324,6 +324,83 @@ test("garbage host env never throws: unresolvable names give the setup hint, bou
   const ctl = await runPrimer(box, { SKYLINE_DAEMON_HOST: "bad\u0001host", SKYLINE_DAEMON_PORT: String(refusedPort) });
   assert.equal(ctl.status, 0, ctl.stderr);
   assert.equal(ctl.stdout, optOut.stdout, "control char: today's output");
+});
+
+test("a DNS lookup that never finishes cannot hold SessionStart: setup hint, exit at the deadline", async (t) => {
+  // destroy() does not cancel an in-flight lookup, and a pending lookup keeps
+  // the event loop alive. Simulated hermetically: a --require preload swaps
+  // dns.lookup for one that answers ENOTFOUND only after a ref'd 10 s timer.
+  // The primer must still exit right after its 300 ms deadline.
+  const box = sandbox(t);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "primer-slowdns-"));
+  t.after(() => cleanup(dir));
+  const preload = path.join(dir, "slow-dns.js");
+  fs.writeFileSync(
+    preload,
+    'const dns = require("dns");\n' +
+      "dns.lookup = function (host, opts, cb) {\n" +
+      '  const done = typeof opts === "function" ? opts : cb;\n' +
+      '  setTimeout(() => done(Object.assign(new Error("getaddrinfo ENOTFOUND " + host), { code: "ENOTFOUND" })), 10000);\n' +
+      "};\n"
+  );
+  const refusedPort = await unusedPort();
+  const optOut = await runPrimer(box, { SKYLINE_PRIMER_NO_DAEMON_CHECK: "1" });
+  const refused = await runPrimer(box, { SKYLINE_DAEMON_PORT: String(refusedPort) });
+  const r = await runPrimer(box, {
+    SKYLINE_DAEMON_HOST: "slow-resolver.invalid",
+    SKYLINE_DAEMON_PORT: String(refusedPort),
+    NODE_OPTIONS: `--require ${preload}`,
+  });
+  const hint = assertOneHint(r, optOut, UNREACHABLE);
+  assert.ok(hint.includes("slow-resolver.invalid:"), hint);
+  assert.ok(r.ms >= 290, `waited for the deadline: ${r.ms}ms`);
+  assert.ok(r.ms - refused.ms < 450, `slow DNS ${r.ms}ms vs refused ${refused.ms}ms: not held by the lookup`);
+});
+
+// Differential: with a daemon answering 200 and the probe ON, stdout equals
+// the pre-probe primer (origin/main ceb71c6, skyline-claude 1.5.39) for the
+// same inputs. Needs the base commit in the local object store; a shallow
+// clone skips (stated, not silently green).
+const PRE_PROBE_SHA = "ceb71c6e3e632151a4a1f6d27928cb90bcf80515";
+test("differential: daemon answering, probe on -> stdout equals the 1.5.39 primer byte for byte", async (t) => {
+  const repo = path.resolve(__dirname, "..", "..", "..");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "primer-pre-probe-"));
+  t.after(() => cleanup(dir));
+  for (const f of ["skyline-primer.js", "loop-report-path.js"]) {
+    const res = require("child_process").spawnSync("git", ["show", `${PRE_PROBE_SHA}:plugins/skyline-claude/hooks/${f}`], {
+      cwd: repo,
+      encoding: "utf8",
+    });
+    if (res.status !== 0 || !res.stdout) {
+      t.skip(`base commit ${PRE_PROBE_SHA.slice(0, 7)} not in the object store`);
+      return;
+    }
+    fs.writeFileSync(path.join(dir, f), res.stdout);
+  }
+  const oldHook = path.join(dir, "skyline-primer.js");
+  const box = sandbox(t);
+  const php = path.join(dir, "php");
+  fs.mkdirSync(php);
+  fs.writeFileSync(path.join(php, "composer.json"), "{}");
+  const reports = path.join(dir, "reports");
+  const d = await httpDaemon(t, 200);
+  const env = { SKYLINE_DAEMON_PORT: String(d.port), SKYLINE_LOOP_REPORT_DIR: reports };
+  const inputs = [
+    { cwd: box.cwd, source: "startup" },
+    { cwd: php, session_id: "0679640f-35d5-435b-8e6a-562c61d7bf1f", source: "compact" },
+    { cwd: repo, source: "resume" },
+    { session_id: "a/b" },
+  ];
+  for (const input of inputs) {
+    const raw = JSON.stringify(input);
+    const now = await runPrimer(box, env, raw);
+    const then = await runPrimer(box, env, raw, oldHook);
+    assert.equal(now.status, 0, now.stderr);
+    assert.equal(then.status, 0, then.stderr);
+    assert.ok(now.stdout.length > 0);
+    assert.equal(now.stdout, then.stdout, raw);
+  }
+  assert.equal(d.requests.length, inputs.length, "one GET per new-primer run, none from the old one");
 });
 
 test("(d) unusable port env: the probe cannot run, output is today's", async (t) => {
