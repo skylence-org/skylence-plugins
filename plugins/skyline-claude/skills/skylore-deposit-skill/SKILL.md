@@ -13,6 +13,7 @@ Depositing into skylore. The bank is operator-wide and append-only: a bad mark i
   you can name what it beat: an expectation it contradicted, or the alternative you rejected
 
 Nothing clears all four ⇒ answer "nothing durable" and stop. An empty deposit is a correct outcome, not a failure.
+Answer where the Stop check says: one `skylore: nothing durable` or `skylore: marked <ids>` line at column 0, appended to the session report file it names (never overwrite it); chat gets nothing or one line. No file named ⇒ answer in chat.
 
 ## RECALL BEFORE YOU MARK — always
 

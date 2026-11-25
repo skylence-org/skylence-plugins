@@ -499,3 +499,150 @@ test("subdir cwd: composer.json at repo root still injects blueprint + php conte
     cleanup(claude);
   }
 });
+
+// --- 1.5.37: loop report paths at SessionStart (Q2) -------------------------
+
+const UUID = "0679640f-35d5-435b-8e6a-562c61d7bf1f";
+const RULE_LINE =
+  "Loop reports (feature FINAL, debug REPORT, review evidence) go to these files; chat gets the short summary the skill names.";
+
+// Hermetic report env: a fresh temp report dir, mode unset (file mode).
+function reportEnv(t, extra = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "primer-reports-"));
+  t.after(() => cleanup(dir));
+  return { dir, env: { SKYLINE_LOOP_REPORT: undefined, SKYLINE_LOOP_REPORT_DIR: dir, ...extra } };
+}
+
+function ctxOf(res) {
+  assert.equal(res.status, 0, res.stderr);
+  return JSON.parse(res.stdout.trim()).hookSpecificOutput.additionalContext;
+}
+
+// Like run(), but every SKYLINE_LOOP_REPORT* var comes only from env (an
+// undefined value removes the key), so the operator's shell cannot leak in.
+function runEnv(input, env, hook = HOOK) {
+  const base = { ...process.env };
+  delete base.SKYLINE_LOOP_REPORT;
+  delete base.SKYLINE_LOOP_REPORT_DIR;
+  const merged = {
+    ...base,
+    SKYLORE_DB: path.join(os.tmpdir(), "primer-no-such-bank.db"),
+    CLAUDE_CONFIG_DIR: path.join(os.tmpdir(), "primer-no-such-claude-dir"),
+    ...env,
+  };
+  for (const [k, v] of Object.entries(merged)) if (v === undefined) delete merged[k];
+  return spawnSync(process.execPath, [hook], { encoding: "utf8", input: JSON.stringify(input), env: merged });
+}
+
+test("Q2: file mode names this session's three report files once, on every SessionStart source incl. compact", (t) => {
+  const { dir, env } = reportEnv(t);
+  for (const source of ["startup", "resume", "clear", "compact", undefined]) {
+    const ctx = ctxOf(runEnv({ cwd: os.tmpdir(), session_id: UUID, source }, env));
+    const expected =
+      `Loop report files for this session: feature FINAL \`${path.join(dir, `${UUID}.md`)}\`, ` +
+      `debug REPORT \`${path.join(dir, `${UUID}.debug.md`)}\`, review evidence \`${path.join(dir, `${UUID}.review.md`)}\`. ` +
+      RULE_LINE;
+    assert.ok(ctx.includes(expected), `source ${source}: ${ctx}`);
+    assert.equal(ctx.split("Loop report files for this session").length, 2, "exactly one block");
+    assert.ok(ctx.startsWith(ABS_PREFIX), "env facts stay front-loaded");
+  }
+  assert.deepEqual(fs.readdirSync(dir), [], "the primer never creates a report file");
+});
+
+test("Q2: the primer's SessionStart entry in hooks.json has no matcher, so it also runs on source=compact", () => {
+  const hooks = JSON.parse(fs.readFileSync(path.resolve(__dirname, "hooks.json"), "utf8")).hooks.SessionStart;
+  const primer = hooks.filter((e) => e.hooks.some((h) => (h.args || []).some((a) => a.endsWith("/skyline-primer.js"))));
+  assert.equal(primer.length, 1, "one primer entry");
+  assert.equal(primer[0].matcher, undefined, "no matcher: every source (startup, resume, clear, compact)");
+});
+
+test("Q2/Q6: chat mode, an unusable session_id and no home dir add nothing: output equals the no-session output", (t) => {
+  const { env } = reportEnv(t);
+  const cwd = os.tmpdir();
+  const plain = ctxOf(runEnv({ cwd, source: "compact" }, env));
+  assert.ok(!plain.includes("Loop report files"), plain);
+  assert.equal(ctxOf(runEnv({ cwd, session_id: UUID, source: "compact" }, { ...env, SKYLINE_LOOP_REPORT: "chat" })), plain);
+  for (const sid of [".", "..", "", 42, null]) {
+    assert.equal(ctxOf(runEnv({ cwd, session_id: sid, source: "compact" }, env)), plain, `session_id ${String(sid)}`);
+  }
+  const noHome = { SKYLINE_LOOP_REPORT_DIR: undefined, HOME: undefined, USERPROFILE: undefined };
+  assert.equal(ctxOf(runEnv({ cwd, session_id: UUID }, noHome)), ctxOf(runEnv({ cwd }, noHome)), "no home dir");
+  // File mode is the chat output plus the one block, nothing else changed.
+  const file = ctxOf(runEnv({ cwd, session_id: UUID, source: "compact" }, env));
+  assert.ok(file.startsWith(plain + "\n\n"), file);
+  assert.ok(file.slice(plain.length + 2).startsWith("Loop report files for this session"));
+});
+
+// Q6 differential: chat mode output equals the pre-change primer (origin/main
+// 11a0426, skyline-claude 1.5.36) for the same inputs. Needs the base commit in
+// the local object store; a shallow clone skips (stated, not silently green).
+const BASE_SHA = "11a04269a6ada5f923581c246a7560eb5d9d3665";
+function baseHook(t, rel) {
+  const repo = path.resolve(__dirname, "..", "..", "..");
+  const res = spawnSync("git", ["show", `${BASE_SHA}:${rel}`], { cwd: repo, encoding: "utf8" });
+  if (res.status !== 0 || !res.stdout) return null;
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "primer-base-"));
+  t.after(() => cleanup(d));
+  const p = path.join(d, path.basename(rel));
+  fs.writeFileSync(p, res.stdout);
+  return p;
+}
+
+test("Q6 differential: SKYLINE_LOOP_REPORT=chat output equals the 1.5.36 primer for the same inputs", (t) => {
+  const old = baseHook(t, "plugins/skyline-claude/hooks/skyline-primer.js");
+  if (!old) {
+    t.skip(`base commit ${BASE_SHA.slice(0, 7)} not in the object store`);
+    return;
+  }
+  const { env } = reportEnv(t, { SKYLINE_LOOP_REPORT: "chat" });
+  const php = markerDir("composer.json");
+  t.after(() => cleanup(php));
+  for (const input of [
+    { cwd: os.tmpdir(), session_id: UUID, source: "startup" },
+    { cwd: php, session_id: UUID, source: "compact" },
+    { cwd: php, session_id: "a/b", source: "resume" },
+    { session_id: UUID },
+  ]) {
+    const now = runEnv(input, env);
+    const then = runEnv(input, env, old);
+    assert.equal(now.status, then.status);
+    assert.equal(now.stdout, then.stdout, JSON.stringify(input));
+    assert.ok(now.stdout.length > 0);
+  }
+});
+
+// Bounce 1 M3: a box that only runs debug / review / non-loop sessions never
+// reaches the gate's prune, so the primer prunes too (same function, file
+// mode only, never the current session's three files).
+test("M3: SessionStart prunes other sessions' old headered debug/review/stub reports; current files and non-reports survive", (t) => {
+  const { dir, env } = reportEnv(t);
+  const at = (n) => path.join(dir, n);
+  const old = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
+  const put = (n, body, aged = true) => {
+    fs.writeFileSync(at(n), body);
+    if (aged) fs.utimesSync(at(n), old, old);
+  };
+  const hdr = (k) => `# ${k}-loop REPORT\nloop-report: v1\nx\n`;
+  put("other.debug.md", hdr("debug"));
+  put("other.review.md", hdr("review"));
+  put("stub-session.md", "# skylore REPORT\nloop-report: v1\nskylore: nothing durable\n");
+  put("recent.debug.md", hdr("debug"), false);
+  put("old-headerless.review.md", "# notes\n");
+  put("README.md", "# readme\n");
+  put(`${UUID}.md`, "# feature-loop FINAL\nloop-report: v1\n");
+  put(`${UUID}.debug.md`, hdr("debug"));
+  put(`${UUID}.review.md`, hdr("review"));
+  const before = fs.readdirSync(dir).sort();
+
+  // Chat mode and an unusable session_id prune nothing.
+  ctxOf(runEnv({ cwd: os.tmpdir(), session_id: UUID }, { ...env, SKYLINE_LOOP_REPORT: "chat" }));
+  ctxOf(runEnv({ cwd: os.tmpdir(), session_id: "." }, env));
+  ctxOf(runEnv({ cwd: os.tmpdir(), session_id: UUID }, { ...env, SKYLINE_LOOP_REPORT_RETENTION_DAYS: "0" }));
+  assert.deepEqual(fs.readdirSync(dir).sort(), before, "chat mode, no usable id, retention 0: nothing pruned");
+
+  ctxOf(runEnv({ cwd: os.tmpdir(), session_id: UUID, source: "startup" }, env));
+  assert.deepEqual(
+    fs.readdirSync(dir).sort(),
+    ["README.md", "old-headerless.review.md", "recent.debug.md", `${UUID}.debug.md`, `${UUID}.md`, `${UUID}.review.md`].sort()
+  );
+});
