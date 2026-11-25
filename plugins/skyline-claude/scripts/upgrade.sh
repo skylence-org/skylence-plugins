@@ -42,6 +42,30 @@ STEP=/dev/null
 NL='
 '
 
+# The summary file's text until the run finishes: a run the daemon restart
+# (or anything else) stops early leaves this, never a previous run's result.
+started_text() {
+  printf '%s' "skyline upgrade started (pid $$) and has not finished. If this is still the text after the upgrade call returned, wait a few seconds and read it again. If it still does not change, the script was stopped before its summary (a daemon restart can stop it): the upgrade is NOT confirmed. Full output so far: $LOG"
+}
+# progress/finished: rewrite the "has not finished" text with the last step
+# started and the last step finished (ruling 1611), so a run stopped
+# anywhere leaves an honest record.
+last_started="none yet"
+last_finished="none yet"
+progress() {
+  last_started="$1"
+  write_progress
+}
+finished() {
+  last_finished="$1"
+  write_progress
+}
+write_progress() {
+  [ -n "$SUMMARY" ] || return 0
+  printf '%s\nLast step started: %s\nLast step finished: %s\n' "$(started_text)" "$last_started" "$last_finished" \
+    2>/dev/null >"$SUMMARY"
+}
+
 use_dir() {
   mkdir -p "$1" 2>/dev/null || return 1
   LOG="$1/${2}upgrade.log"
@@ -49,8 +73,7 @@ use_dir() {
   STEP="$1/${2}upgrade-step.out"
   printf '' 2>/dev/null >"$LOG" || return 1
   printf '' 2>/dev/null >"$STEP" || return 1
-  printf '%s\n' "skyline upgrade started (pid $$) and has not finished. If this is still the text after the upgrade call returned, wait a few seconds and read it again; if it does not change, the script was stopped before its summary. Step output so far: $LOG" \
-    2>/dev/null >"$SUMMARY" || return 1
+  printf '%s\n' "$(started_text)" 2>/dev/null >"$SUMMARY" || return 1
 }
 if use_dir "${XDG_CACHE_HOME:-$HOME/.cache}/skyline" ""; then
   true
@@ -107,10 +130,11 @@ note_fail() {
   if [ -z "$failed" ]; then failed="$1"; else failed="$failed; $1"; fi
 }
 
-# The first version token (`skyline 1.4.1`, `skyline v10.2.3`,
-# `skyline 1.5.0-rc.1`); a line without one is no version at all.
+# The version from `skyline --version`, whose shape is `skyline 1.3.0`
+# (also `skyline v10.2.3`, `skyline 1.5.0-rc.1`). Any other line, including
+# a warning that happens to contain a dotted number, is no version at all.
 skyline_version() {
-  { skyline --version | sed -n 's/^[^0-9]*\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*[-+.0-9A-Za-z]*\).*/\1/p' | head -n 1; } 2>/dev/null
+  { skyline --version | sed -n 's/^skyline[[:space:]][[:space:]]*v\{0,1\}\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*[-+.0-9A-Za-z]*\).*/\1/p' | head -n 1; } 2>/dev/null
 }
 
 if [ -n "$SUMMARY" ]; then
@@ -135,6 +159,7 @@ before=$(skyline_version)
 # its release check degrades ("no upgrade applied"), so its output is checked
 # too: that case is a failed update, not "already current" (#45).
 update_failed=""
+progress "binary update: skyline update --check, then npm i -g or skyline update --yes (step 1 of 3)"
 run_step skyline update --check
 log_step
 case "$STEP_OUT" in
@@ -160,6 +185,11 @@ else
   esac
 fi
 [ -z "$update_failed" ] || note_fail "update failed: $update_failed"
+if [ -n "$update_failed" ]; then
+  finished "binary update: failed: $update_failed"
+else
+  finished "binary update: $update_step exited 0"
+fi
 
 # The update may have moved the binary; drop the shell's cached path.
 hash -r 2>/dev/null || true
@@ -167,6 +197,7 @@ hash -r 2>/dev/null || true
 # 2. Re-run setup: daemon unit, marketplace plugins, agent wiring. It runs
 # before the restart because it does not replace it: setup returns early when
 # its fingerprint already matches, and its own restart is best-effort.
+progress "skyline setup (step 2 of 3)"
 run_step skyline setup
 setup_rc=$?
 show_step
@@ -176,9 +207,11 @@ else
   setup_status="failed (exit $setup_rc)"
   note_fail "setup failed: skyline setup (exit $setup_rc)"
 fi
+finished "skyline setup: $setup_status"
 
 # 3. Restart the daemon so it runs the freshly installed binary; install the
 # service when there is nothing to restart (a failed restart is only logged).
+progress "skyline daemon restart --port $PORT (step 3 of 3)"
 if run_step skyline daemon restart --port "$PORT"; then
   show_step
   daemon_status="restarted on port $PORT"
@@ -193,6 +226,7 @@ else
     note_fail "daemon restart failed: skyline daemon restart/install --port $PORT"
   fi
 fi
+finished "daemon: $daemon_status"
 
 # An unreadable version after the upgrade is a failure, never "already current".
 after=$(skyline_version)

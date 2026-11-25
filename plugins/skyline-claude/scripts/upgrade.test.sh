@@ -93,6 +93,7 @@ case "$1 ${2:-}" in
   "--version ")
     if [ -f "$S/noversion" ]; then :
     elif [ -f "$S/garbage" ]; then echo "warning: deprecated flag"
+    elif [ -f "$S/garbage_text" ]; then cat "$S/garbage_text"
     elif [ -f "$S/garbage_until_update" ] && [ ! -f "$S/updated" ]; then echo "warning: deprecated flag"
     elif [ -f "$S/vprefix" ]; then echo "skyline v$v"
     else echo "skyline $v"
@@ -125,7 +126,10 @@ case "$1 ${2:-}" in
     echo "fake setup done" || exit 7
     [ -f "$S/kill_at_setup" ] && kill -9 "$PPID"
     exit "$(rcfile setup_rc)" ;;
-  "daemon restart") exit "$(rcfile restart_rc)" ;;
+  "daemon restart")
+    # A systemd restart SIGTERMs every process of the daemon's unit.
+    [ -f "$S/term_at_restart" ] && kill -TERM "$PPID"
+    exit "$(rcfile restart_rc)" ;;
   "daemon install") exit "$(rcfile install_rc)" ;;
   *) echo "fake skyline: unexpected argv: $*" >&2; exit 99 ;;
 esac
@@ -147,12 +151,13 @@ EOF
 
 # run_case <shell> <case-name> key=value...
 #   state keys (written to the fakes' state dir): mode version next setup_rc
-#   restart_rc install_rc npm_rc noversion garbage garbage_until_update
-#   vprefix kill_at_setup
+#   restart_rc install_rc npm_rc noversion garbage garbage_text
+#   garbage_until_update vprefix kill_at_setup term_at_restart
 #   special keys: noskyline=1 (no fake skyline), io=closed (stdout+stderr
 #   closed) | io=reader (a reader that takes the first line and exits),
-#   xdgfile=1 (XDG_CACHE_HOME is a regular file), tmpfile=1 (so is TMPDIR),
-#   stale=1 (a previous run's "Upgrade complete." summary is in place).
+#   xdg=unset|elsewhere (no XDG_CACHE_HOME, or one outside HOME), xdgfile=1
+#   (XDG_CACHE_HOME is a regular file), tmpfile=1 (so is TMPDIR), stale=1
+#   (a previous run's "Upgrade complete." summary is in place).
 run_case() {
   SH="$1"; CASE="$2"; shift 2
   DIR="$ROOT/$SH-$CASE"
@@ -173,6 +178,11 @@ run_case() {
     case "$k" in
       noskyline) rm -f "$DIR/bin/skyline" ;;
       io) io="$v" ;;
+      xdg)
+        if [ "$v" = unset ]; then XDG=unset; else XDG="$DIR/xdg"; fi
+        if [ "$v" = elsewhere ]; then
+          SUMF="$DIR/xdg/skyline/upgrade-summary.txt"; LOGF="$DIR/xdg/skyline/upgrade.log"
+        fi ;;
       xdgfile)
         XDG="$DIR/xdg-is-a-file"; : >"$XDG"
         SUMF="$DIR/tmp/skyline-upgrade-summary.txt"; LOGF="$DIR/tmp/skyline-upgrade.log" ;;
@@ -187,26 +197,25 @@ run_case() {
   : >"$STATE/calls"
   : >"$OUT"
   SHP=$(command -v "$SH")
+  ENVV=(PATH="$DIR/bin:$TOOLS" HOME="$DIR/home" TMPDIR="$TMPD" FAKE_STATE="$STATE")
+  [ "$XDG" = unset ] || ENVV+=(XDG_CACHE_HOME="$XDG")
   case "$io" in
     normal)
       # In a subshell (the trailing exit keeps it from exec'ing env), so the
       # "Killed" notice of the kill case goes to /dev/null, not the report.
       (
-        env -i PATH="$DIR/bin:$TOOLS" HOME="$DIR/home" XDG_CACHE_HOME="$XDG" TMPDIR="$TMPD" FAKE_STATE="$STATE" \
-          "$SHP" "$SCRIPT" >"$OUT" 2>&1
+        env -i "${ENVV[@]}" "$SHP" "$SCRIPT" >"$OUT" 2>&1
         exit $?
       ) 2>/dev/null
       RC=$? ;;
     closed)
-      env -i PATH="$DIR/bin:$TOOLS" HOME="$DIR/home" XDG_CACHE_HOME="$XDG" TMPDIR="$TMPD" FAKE_STATE="$STATE" \
-        "$SHP" "$SCRIPT" >&- 2>&-
+      env -i "${ENVV[@]}" "$SHP" "$SCRIPT" >&- 2>&-
       RC=$? ;;
     reader)
       echo 1 >"$STATE/wait_reader"
       # The reader closes its end before it signals, so the pipe is dead for
       # every write after the first line.
-      env -i PATH="$DIR/bin:$TOOLS" HOME="$DIR/home" XDG_CACHE_HOME="$XDG" TMPDIR="$TMPD" FAKE_STATE="$STATE" \
-        "$SHP" "$SCRIPT" 2>&1 | { head -n 1 >"$OUT"; exec 0<&-; : >"$STATE/reader_gone"; }
+      env -i "${ENVV[@]}" "$SHP" "$SCRIPT" 2>&1 | { head -n 1 >"$OUT"; exec 0<&-; : >"$STATE/reader_gone"; }
       RC=${PIPESTATUS[0]} ;;
   esac
 }
@@ -374,6 +383,15 @@ for SHELL_UNDER_TEST in $SHELLS; do
   rc_is 0
   has "binary: at 1.4.1 (the version before the upgrade is unknown)"
   hasnt "updated unknown"
+  # A warning line that happens to hold a dotted number is no version either.
+  run_case "$S" dotted-garbage-since mode=npm "garbage_text=warning: deprecated since 2.0.0"
+  rc_is 1
+  has "binary: version unknown: skyline --version printed no version number"
+  hasnt "already current"
+  run_case "$S" dotted-garbage-ip mode=npm "garbage_text=error: 127.0.0.1 refused"
+  rc_is 1
+  has "binary: version unknown: skyline --version printed no version number"
+  hasnt "already current"
   # Two-digit major, two-digit patch, pre-release suffix, leading v.
   run_case "$S" two-digit-major mode=npm version=10.2.3 next=10.2.4
   rc_is 0
@@ -425,9 +443,33 @@ for SHELL_UNDER_TEST in $SHELLS; do
   if [ "$RC" -ne 0 ]; then ok; else bad "a killed run exited 0"; fi
   calls_are "skyline update --check | npm i -g @skylence-ai/skyline@latest | skyline setup"
   summary_has "has not finished"
+  summary_has "Last step started: skyline setup (step 2 of 3)"
+  summary_has "the upgrade is NOT confirmed"
+  summary_has "Last step finished: binary update: npm i -g @skylence-ai/skyline@latest exited 0"
+
+  # SIGTERM right after the setup step, as a systemd restart does to every
+  # process of the daemon's unit (ruling 1611): the record says not finished,
+  # restart started, setup finished, and carries no final exit code.
+  run_case "$S" term-after-setup mode=npm term_at_restart=1
+  if [ "$RC" -ne 0 ]; then ok; else bad "a SIGTERMed run exited 0"; fi
+  calls_are "$FULL_CALLS"
+  summary_has "has not finished"
+  summary_has "Last step started: skyline daemon restart --port 7333 (step 3 of 3)"
+  summary_has "Last step finished: skyline setup: ok"
+  if grep -qF "exit code:" "$SUMF"; then bad "a stopped run wrote a final summary"; else ok; fi
   if grep -qF "Upgrade complete." "$SUMF"; then bad "stale summary survived"; else ok; fi
 
   # --- where the summary goes ---------------------------------------------------
+  # XDG_CACHE_HOME unset: $HOME/.cache/skyline. Set elsewhere: $XDG/skyline.
+  run_case "$S" xdg-unset mode=npm xdg=unset
+  rc_is 0
+  summary_ok
+  has "summary file $DIR/home/.cache/skyline/upgrade-summary.txt"
+  run_case "$S" xdg-elsewhere mode=npm xdg=elsewhere
+  rc_is 0
+  summary_ok
+  has "summary file $DIR/xdg/skyline/upgrade-summary.txt"
+  if [ -e "$DIR/home/.cache" ]; then bad "wrote under HOME/.cache although XDG_CACHE_HOME is set"; else ok; fi
   # Cache dir cannot be created: ${TMPDIR}/skyline-upgrade-summary.txt.
   run_case "$S" xdg-unwritable mode=npm xdgfile=1
   rc_is 0
