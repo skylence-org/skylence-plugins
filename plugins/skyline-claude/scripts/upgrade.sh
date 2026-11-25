@@ -85,12 +85,18 @@ else
   note_fail "daemon restart failed: skyline daemon restart/install --port $PORT"
 fi
 
+# An unreadable version after the upgrade is a failure, never "already current".
 after=$(skyline_version)
-[ -n "$after" ] || after="unknown"
+if [ -z "$after" ]; then
+  after="unknown"
+  note_fail "version check failed: skyline --version printed nothing after the upgrade"
+fi
 bin_path=$(command -v skyline)
 
 if [ -n "$update_failed" ]; then
   binary_status="update failed: $update_failed; skyline is at $after"
+elif [ "$after" = "unknown" ]; then
+  binary_status="version unknown: skyline --version printed nothing"
 elif [ "$before" != "$after" ]; then
   binary_status="updated $before -> $after"
 else
@@ -98,20 +104,21 @@ else
 fi
 
 echo ""
-echo "skyline upgrade summary:"
-echo "  binary: $binary_status ($bin_path)"
-echo "  setup:  $setup_status"
-echo "  daemon: $daemon_status"
-echo ""
 echo "To update the skyline-claude plugin:"
 echo "  claude plugin marketplace update skylence-plugins && claude plugin update skyline-claude@skylence-plugins"
 echo "  codex plugin marketplace upgrade skylence-plugins"
 echo ""
 echo "Restart your agent session to load the updated plugin."
 
+# The summary is the closing text: it is what an operator or agent acts on.
+echo ""
+echo "skyline upgrade summary:"
+echo "  binary: $binary_status ($bin_path)"
+echo "  setup:  $setup_status"
+echo "  daemon: $daemon_status"
 if [ -n "$failed" ]; then
-  echo ""
-  echo "Upgrade did not complete cleanly: $failed" >&2
+  echo "Upgrade did not complete cleanly: $failed"
   exit 1
 fi
+echo "Upgrade complete."
 exit 0

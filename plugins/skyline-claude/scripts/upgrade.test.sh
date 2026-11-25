@@ -4,7 +4,7 @@
 #
 # Never touches the real skyline, npm or daemon: each case runs upgrade.sh
 # under `env -i` with PATH = a temp dir holding a fake `skyline` and a fake
-# `npm` (plus /usr/bin:/bin), HOME and TMPDIR redirected into the temp root.
+# `npm` plus symlinks to head/sed/grep/cat/cp, HOME and TMPDIR redirected.
 # The fakes record their argv; the fake `npm i -g` and `skyline update --yes`
 # "install" a new version by rewriting the version file `skyline --version`
 # reads. Every case runs under both `bash` and `sh`, after `sh -n`/`bash -n`.
@@ -15,6 +15,16 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 SCRIPT="$HERE/upgrade.sh"
 ROOT=$(mktemp -d "${TMPDIR:-/tmp}/skyline-upgrade-test.XXXXXX")
 trap 'rm -rf "$ROOT"' EXIT
+
+# PATH inside each case is ONLY the fakes plus symlinks to the few tools
+# upgrade.sh and the fakes use, so a real skyline/npm can never be reached
+# (not even one installed under /usr/bin), including in the no-skyline case.
+TOOLS="$ROOT/tools"
+mkdir -p "$TOOLS"
+for t in head sed grep cat cp; do
+  p=$(command -v "$t") || { echo "missing tool: $t"; exit 1; }
+  ln -s "$p" "$TOOLS/$t"
+done
 
 pass=0
 fail=0
@@ -34,6 +44,10 @@ bad() {
 has() { if grep -qF -- "$1" "$OUT"; then ok; else bad "expected output to contain: $1"; fi; }
 hasnt() { if grep -qF -- "$1" "$OUT"; then bad "expected output NOT to contain: $1"; else ok; fi; }
 rc_is() { if [ "$RC" -eq "$1" ]; then ok; else bad "exit code $RC, expected $1"; fi; }
+last_is() {
+  got=$(tail -n 1 "$OUT")
+  if [ "$got" = "$1" ]; then ok; else bad "last line was: [$got] expected: [$1]"; fi
+}
 calls_are() {
   # The non --version calls, in order, joined with " | ".
   got=$(grep -v -- ' --version$' "$STATE/calls" 2>/dev/null | tr '\n' '|' | sed 's/|$//; s/|/ | /g')
@@ -51,7 +65,7 @@ v=$(cat "$S/version")
 mode=$(cat "$S/mode")
 rcfile() { if [ -f "$S/$1" ]; then cat "$S/$1"; else echo 0; fi; }
 case "$1 ${2:-}" in
-  "--version ") echo "skyline $v" ;;
+  "--version ") [ -f "$S/noversion" ] || echo "skyline $v" ;;
   "update --check")
     case "$mode" in
       npm) echo "skyline is managed by npm. To upgrade, run:"; echo "  npm i -g @skylence-ai/skyline@latest" ;;
@@ -105,8 +119,8 @@ run_case() {
     if [ "$k" = noskyline ]; then rm -f "$DIR/bin/skyline"; else echo "$v" >"$STATE/$k"; fi
   done
   : >"$STATE/calls"
-  env -i PATH="$DIR/bin:/usr/bin:/bin" HOME="$DIR/home" TMPDIR="$DIR/tmp" FAKE_STATE="$STATE" \
-    "$SH" "$SCRIPT" >"$OUT" 2>&1
+  env -i PATH="$DIR/bin:$TOOLS" HOME="$DIR/home" TMPDIR="$DIR/tmp" FAKE_STATE="$STATE" \
+    "$(command -v "$SH")" "$SCRIPT" >"$OUT" 2>&1
   RC=$?
 }
 
@@ -200,6 +214,19 @@ for SHELL_UNDER_TEST in bash sh; do
   rc_is 1
   has "skyline is not on PATH; nothing was upgraded."
   calls_are ""
+
+  # The summary is the closing text: its last line says complete or not.
+  run_case "$S" closing-ok mode=npm
+  last_is "Upgrade complete."
+  run_case "$S" closing-fail mode=degraded
+  last_is "Upgrade did not complete cleanly: update failed: update check (no upgrade applied)"
+
+  # `skyline --version` prints nothing -> a failed step, never "already current".
+  run_case "$S" no-version mode=npm noversion=1
+  rc_is 1
+  has "binary: version unknown: skyline --version printed nothing"
+  hasnt "already current"
+  has "version check failed: skyline --version printed nothing after the upgrade"
 done
 
 echo "upgrade.test.sh: $pass passed, $fail failed"
