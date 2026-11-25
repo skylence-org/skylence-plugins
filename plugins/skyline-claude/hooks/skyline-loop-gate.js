@@ -34,6 +34,9 @@
  *
  * FINAL report file (1.5.35; operator: the FINAL block is for the LLM, not
  * for a human reading chat, so it is stored and chat gets one line):
+ *  - path rules (dir, sid sanitizing, per-kind names) live in
+ *    loop-report-path.js since 1.5.37, shared with the primer and the
+ *    skylore deposit hook; the FINAL path below is unchanged.
  *  - path: <reportDir>/<sid>.md. reportDir = $SKYLINE_LOOP_REPORT_DIR when
  *    it is an ABSOLUTE path (a relative value is ignored as if unset: it
  *    would resolve against each hook process's cwd), else
@@ -66,9 +69,18 @@
  *    retention window AND carry the `loop-report: v<N>` header line in their
  *    first 256 bytes (read through the same no-follow fd), so a report dir
  *    that is, or links to, a notes or project dir never loses the user's
- *    files. Never recursing, never following symlinks, never the current
- *    session's file, at most 500 entries scanned, errors swallowed.
+ *    files. Never recursing, never following symlinks, never any of the
+ *    current session's files (FINAL, .debug.md, .review.md; other sessions'
+ *    debug and review reports are *.md with the header, so they are pruned
+ *    by the same rule), at most 500 entries scanned, errors swallowed.
  *    Headerless reports are never pruned (a leak, not a loss).
+ *    The prune is loop-report-path.js pruneReports; since 1.5.37 the primer
+ *    also runs it at every SessionStart (file mode, usable session_id), so a
+ *    box without feature-loop passes still prunes.
+ *  - C2 CHECKPOINT liveness (1.5.37, file mode, Stop only): a report that
+ *    passes every field check must also show each of its done/skipped/n/a
+ *    CHECKPOINT lines written live, before the FINAL write (see
+ *    checkpointLiveness below); else field `checkpoint-not-live`.
  *
  * Env:
  *  - SKYLINE_LOOP_REPORT = file (default, also any unknown value) | chat.
@@ -87,10 +99,18 @@
  * exist, fails a check, or cannot be read blocks (at most MAX_BLOCKS times).
  */
 
-const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const {
+  MAX_REPORT_BYTES,
+  REPORT_OPEN_FLAGS,
+  isLoopReport,
+  pruneReports,
+  reportPath: sessionReportPath,
+  reportPaths,
+  sessionFileBase,
+} = require("./loop-report-path");
 
 const MAX_BLOCKS = 2;
 
@@ -159,21 +179,116 @@ function missingFields(text) {
   return FIELD_CHECKS.filter(([, ok]) => !ok(t)).map(([key]) => key);
 }
 
-// Report file limits (see header). 256 KiB is far above any real FINAL (a
-// few KB) and keeps a runaway write from being slurped into the hook.
-const MAX_REPORT_BYTES = 262144;
-const DEFAULT_RETENTION_DAYS = 30;
-const PRUNE_SCAN_LIMIT = 500;
-const DAY_MS = 24 * 60 * 60 * 1000;
-// O_NOFOLLOW closes the lstat -> open symlink-swap window; O_NONBLOCK keeps a
-// FIFO swapped in after lstat from hanging the Stop hook. Both are absent on
-// Windows (0 here), where the lstat check alone stands.
-const REPORT_OPEN_FLAGS =
-  fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0);
-// The header line the skill writes as the report's 2nd line. It marks a file
-// as a loop report for pruning; the GATE never requires it (D11).
-const LOOP_REPORT_HEADER = /^loop-report: v\d+\s*$/m;
-const HEADER_SCAN_BYTES = 256;
+// Report file limits (see header): MAX_REPORT_BYTES (256 KiB) and the
+// no-follow, non-blocking REPORT_OPEN_FLAGS come from loop-report-path.js, as
+// do retention (pruneReports, isLoopReport) and its constants.
+
+// C2 (1.5.37): CHECKPOINT liveness in file mode. feature-loop-skill appends
+// each live CHECKPOINT line to the FINAL report file by its own tool call the
+// moment the checkpoint resolves; FINAL then completes the file. A file
+// written in one go at the end could carry reconstructed lines, so a report
+// passes only when every done/skipped/n/a CHECKPOINT line in it also appears
+// EARLIER in the transcript: in an assistant tool_use whose input names the
+// report path (live append), or in an assistant text message (the pre-1.5.37
+// chat habit), before the first tool_use that wrote the FINAL fields (slices
+// shipped / test counts) to that path. Tool-name agnostic (create, edit, a
+// Bash echo): it reads the input's DECODED string values, not JSON text, so
+// Windows backslashes and quotes in a skipped(reason) cannot break the match.
+// Line key = name + state + an immediately following "(...)", case- and
+// whitespace-normalised; trailing text after it is ignored. `= not-emitted`
+// needs no live write. FINAL write not in the transcript (it can trail the
+// file, skylore 669): still blocks, but the message lets an honest model
+// stop again unchanged instead of recording a false deviation. Known limits:
+// a FINAL printed in chat passes via the legacy text path without this
+// check, and it proves "written before the FINAL write", not "written when
+// the checkpoint resolved".
+const LIVE_KEY = "checkpoint-not-live";
+const CHECKPOINT_KEY_G =
+  /checkpoint:[ \t]*(post-model|post-first-surface|pre-final)[ \t]*=[ \t]*(done|skipped|n\/a)(\([^\n)]*\))?/gi;
+const FINAL_WRITE_MARK = /slices?\s+shipped|test\s*counts?/i;
+const MAX_INPUT_DEPTH = 8;
+
+function checkpointKeys(t) {
+  const out = [];
+  for (const m of String(t).matchAll(CHECKPOINT_KEY_G)) {
+    const reason = m[3] ? m[3].replace(/\s+/g, " ") : "";
+    out.push({ key: `${m[1]}=${m[2]}${reason}`.toLowerCase(), line: m[0].trim() });
+  }
+  return out;
+}
+
+function inputStrings(v, out, depth) {
+  if (typeof v === "string") out.push(v);
+  else if (v && typeof v === "object" && depth < MAX_INPUT_DEPTH) {
+    for (const x of Object.values(v)) inputStrings(x, out, depth + 1);
+  }
+  return out;
+}
+
+// p occurs in s as a whole path: not glued to more name characters before it
+// or after it (`x<p>`, `<p>x`, `<p>.bak` do not count; `<p>#TAG`, `<p>"` do).
+function containsPath(s, p) {
+  for (let i = s.indexOf(p); i !== -1; i = s.indexOf(p, i + 1)) {
+    const before = i > 0 ? s[i - 1] : "";
+    const rest = s.slice(i + p.length, i + p.length + 2);
+    if (/^[A-Za-z0-9._-]$/.test(before) || /^(?:[A-Za-z0-9_-]|\.[A-Za-z0-9])/.test(rest)) continue;
+    return true;
+  }
+  return false;
+}
+
+function checkpointLiveness(text, reportFile, reportText) {
+  const wanted = checkpointKeys(reportText);
+  if (!wanted.length) return { notLive: [], finalVisible: true };
+  const live = new Set();
+  let finalVisible = false;
+  // The same file under its resolved dir too (bounce 1 M1, skylore 676):
+  // skyline create answers with the realpath anchor (/tmp -> /private/tmp, a
+  // symlinked ~/.skylence), and the model's later edit appends carry it.
+  const names = [reportFile];
+  try {
+    const real = path.join(fs.realpathSync(path.dirname(reportFile)), path.basename(reportFile));
+    if (real !== reportFile) names.push(real);
+  } catch (_e) {
+    /* dir missing or unreadable: the literal path only */
+  }
+  forEachAssistantMessage(text, (content) => {
+    for (const block of content) {
+      if (finalVisible) return;
+      if (!block || typeof block !== "object") continue;
+      if (block.type === "text") {
+        if (typeof block.text === "string" && /checkpoint:/i.test(block.text)) {
+          for (const k of checkpointKeys(block.text)) live.add(k.key);
+        }
+      } else if (block.type === "tool_use") {
+        const s = inputStrings(block.input, [], 0).join("\n");
+        if (!names.some((p) => containsPath(s, p))) continue;
+        // The FINAL mark is looked for OUTSIDE CHECKPOINT lines: a reason
+        // such as skipped(docs only, test counts unchanged) is not a FINAL.
+        if (FINAL_WRITE_MARK.test(s.replace(CHECKPOINT_KEY_G, ""))) {
+          finalVisible = true;
+          return;
+        }
+        for (const k of checkpointKeys(s)) live.add(k.key);
+      }
+    }
+  });
+  const notLive = [];
+  const seen = new Set();
+  for (const w of wanted) {
+    if (live.has(w.key) || seen.has(w.key)) continue;
+    seen.add(w.key);
+    notLive.push(w.line);
+  }
+  return { notLive, finalVisible };
+}
+
+function liveNote(notLive, finalVisible) {
+  const lines = notLive.map((l) => `\`${l}\``).join(", ");
+  return finalVisible
+    ? ` CHECKPOINT line(s) with no live write before the FINAL write: ${lines}. Each CHECKPOINT line is appended to this file by its own tool call the moment its checkpoint resolves, before the FINAL write; a checkpoint whose line was not written then is \`CHECKPOINT: <name> = not-emitted\`, named under deviations.`
+    : ` CHECKPOINT line(s) with no live write visible: ${lines}. The transcript does not show the FINAL write yet, so it may trail the file: if each line was appended by its own call before the FINAL write, stop again without changing those lines; otherwise mark it \`CHECKPOINT: <name> = not-emitted\` and name it under deviations.`;
+}
 
 // Pre-1.5.35 texts, byte for byte, except the 1.5.36 checkpoint clause of
 // FINAL_FIELDS_DEMAND (now asks for `= not-emitted`). Chat mode (SKYLINE_LOOP_REPORT=chat) and
@@ -324,20 +439,13 @@ function chatSoftNote(text) {
   return note;
 }
 
-// Report path and block counter share one session-id helper: a raw id like
-// "../../x" must never steer a path out of its directory (path.join
-// normalizes ".." segments), and two distinct raw ids must never share a
-// file ("a/b" vs "a_b"): an id the sanitizer changed gets "-" + the first 8
-// hex chars of sha256(raw id). Real Claude Code ids are UUIDs and pass
-// through unchanged, so the counter path of a real session is what it
-// always was.
-function sanitizeSessionId(raw) {
-  if (typeof raw !== "string") return null;
-  const clean = raw.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 128);
-  if (!clean || clean === "." || clean === "..") return null;
-  if (clean === raw) return clean;
-  return `${clean}-${crypto.createHash("sha256").update(raw).digest("hex").slice(0, 8)}`;
-}
+// Report path and block counter share one session-id helper
+// (loop-report-path.js sessionFileBase, moved there unchanged in 1.5.37): a
+// raw id like "../../x" never steers a path out of its directory, and two
+// distinct raw ids never share a file ("a/b" vs "a_b"). Real Claude Code ids
+// are UUIDs and pass through unchanged, so the counter path of a real session
+// is what it always was.
+const sanitizeSessionId = sessionFileBase;
 
 function blockCountFile(input) {
   const sid = sanitizeSessionId(input.session_id ? String(input.session_id) : "");
@@ -363,36 +471,11 @@ function bumpBlockCount(file) {
   return n;
 }
 
-// SKYLINE_LOOP_REPORT: exactly "chat" restores the pre-1.5.35 behavior; unset
-// or any other value (including "Chat", " chat") means file mode: an unknown
-// value must not silently disable the file path a newer skill text relies
-// on, and the one opt-out spelling stays unambiguous.
-function fileMode() {
-  return process.env.SKYLINE_LOOP_REPORT !== "chat";
-}
-
-function reportDir() {
-  const explicit = process.env.SKYLINE_LOOP_REPORT_DIR;
-  // Absolute only: a relative value would resolve against each hook
-  // process's cwd, so commit and stop could name different files. A relative
-  // value (".", "reports") is ignored exactly as if unset.
-  if (explicit && path.isAbsolute(explicit)) return path.normalize(explicit);
-  const home = process.env.HOME || process.env.USERPROFILE;
-  if (!home) return null;
-  return path.join(path.resolve(home), ".skylence", "skyline", "loop-reports");
-}
-
-// Absolute report path for this session, or null when file mode is off or
-// no usable path exists (no or unusable session_id, no home dir). Never
-// falls back to process.ppid: a parent pid is not a session identity and
-// could hand one session another session's report.
+// FINAL report path for this session (loop-report-path.js: file mode only,
+// usable session_id and home dir, else null; never process.ppid).
 function reportPath(input) {
   try {
-    if (!fileMode()) return null;
-    const sid = sanitizeSessionId(input.session_id);
-    const dir = reportDir();
-    if (!sid || !dir) return null;
-    return path.join(dir, `${sid}.md`);
+    return sessionReportPath(input.session_id, "final");
   } catch (_e) {
     return null;
   }
@@ -411,7 +494,7 @@ function unreadable(e) {
 // state blocks (bounded by MAX_BLOCKS) and the block message says why;
 // "unreadable" is an fs error other than absence (EACCES on the file or its
 // dir, a failing read) and its message also accepts a FINAL in chat.
-function checkReportFile(p) {
+function checkReportFile(p, transcript) {
   let st;
   try {
     st = fs.lstatSync(p);
@@ -446,9 +529,17 @@ function checkReportFile(p) {
     if (n > MAX_REPORT_BYTES) return { state: "too-large" };
     const reportText = buf.toString("utf8", 0, n);
     const missing = missingFields(reportText);
-    return missing.length
-      ? { state: "fields-missing", missing, note: softNote(reportText, missing) }
-      : { state: "ok" };
+    let note = softNote(reportText, missing);
+    // C2 liveness, only when the caller hands the transcript (the Stop path);
+    // the key is appended after the field-table keys.
+    if (transcript !== undefined) {
+      const { notLive, finalVisible } = checkpointLiveness(transcript, p, reportText);
+      if (notLive.length) {
+        missing.push(LIVE_KEY);
+        note += liveNote(notLive, finalVisible);
+      }
+    }
+    return missing.length ? { state: "fields-missing", missing, note } : { state: "ok" };
   } catch (e) {
     return unreadable(e);
   } finally {
@@ -460,89 +551,20 @@ function checkReportFile(p) {
   }
 }
 
-function retentionDays() {
-  const raw = String(process.env.SKYLINE_LOOP_REPORT_RETENTION_DAYS || "").trim();
-  // Digits only: parseInt("7days") would read 7, and "-1" / "1.5" are typos,
-  // not intent; all of them fall back to the default.
-  if (!/^\d+$/.test(raw)) return DEFAULT_RETENTION_DAYS;
-  return Number(raw);
+
+// Basenames of all three of this session's report files (loop-report-path.js
+// kinds): prune never touches any of them, however old.
+function currentSessionNames(input, reportFile) {
+  const names = new Set([path.basename(reportFile)]);
+  const all = reportPaths(input.session_id);
+  if (all) for (const p of Object.values(all)) names.add(path.basename(p));
+  return names;
 }
 
-// True only for a regular file whose first HEADER_SCAN_BYTES carry the
-// loop-report header line, read through the same no-follow, non-blocking
-// fd as the gate's own read. Any error: false (never prune what cannot be
-// proven to be a loop report).
-function isLoopReport(p) {
-  let fd;
-  try {
-    fd = fs.openSync(p, REPORT_OPEN_FLAGS);
-    if (!fs.fstatSync(fd).isFile()) return false;
-    const buf = Buffer.alloc(HEADER_SCAN_BYTES);
-    let n = 0;
-    while (n < buf.length) {
-      const got = fs.readSync(fd, buf, n, buf.length - n, null);
-      if (got === 0) break;
-      n += got;
-    }
-    let head = buf.toString("utf8", 0, n);
-    // A full scan buffer can end mid-line: test complete lines only, so a
-    // line like "loop-report: v1-draft ..." cut at the cap never matches.
-    if (n === HEADER_SCAN_BYTES) head = head.slice(0, head.lastIndexOf("\n") + 1);
-    return LOOP_REPORT_HEADER.test(head);
-  } catch (_e) {
-    return false;
-  } finally {
-    if (fd !== undefined) {
-      try {
-        fs.closeSync(fd);
-      } catch (_e) {
-        /* already closed */
-      }
-    }
-  }
-}
-
-// Best-effort retention, run only after a pass via the report file: delete
-// regular *.md files directly in the report dir whose mtime is older than
-// the retention window AND that carry the loop-report header (isLoopReport),
-// so a report dir that is, or links to, a notes or project dir never loses
-// a README.md or CLAUDE.md. Never recurses, never follows symlinks (lstat +
-// no-follow fd), never touches the current session's report, scans at most
-// PRUNE_SCAN_LIMIT entries, swallows every error.
-function pruneReports(dir, keepName) {
-  const days = retentionDays();
-  if (days === 0) return;
-  const cutoff = Date.now() - days * DAY_MS;
-  let handle;
-  try {
-    handle = fs.opendirSync(dir);
-    for (let i = 0; i < PRUNE_SCAN_LIMIT; i += 1) {
-      const ent = handle.readSync();
-      if (!ent) break;
-      if (ent.name === keepName || !ent.name.endsWith(".md")) continue;
-      try {
-        const p = path.join(dir, ent.name);
-        const st = fs.lstatSync(p);
-        if (st.isFile() && st.mtimeMs < cutoff && isLoopReport(p)) fs.unlinkSync(p);
-      } catch (_e) {
-        /* raced away or not removable: leave it */
-      }
-    }
-  } catch (_e) {
-    /* best-effort */
-  } finally {
-    if (handle) {
-      try {
-        handle.closeSync();
-      } catch (_e) {
-        /* already closed */
-      }
-    }
-  }
-}
 
 function fileCommitContext(reportFile) {
-  return `${COMMIT_CONTEXT} FINAL goes to a file, not chat: write the full FINAL report to \`${reportFile}\` with the skyline create tool (overwrite:true if it exists), then print only \`FINAL stored: ${reportFile}\` plus at most 2 short lines.`;
+  const at = `\`${reportFile}\``;
+  return `${COMMIT_CONTEXT} CHECKPOINT lines go to the report file ${at}, not chat: append each one by its own tool call the moment it resolves (file absent: create it with the lines \`# feature-loop FINAL\` and \`loop-report: v1\` first); a line written later, or inside the FINAL write, is not live. FINAL goes to a file, not chat: write the full FINAL report to ${at} with the skyline create tool (overwrite:true if it exists) keeping the CHECKPOINT lines already in it verbatim, then print only \`FINAL stored: ${reportFile}\` plus at most 2 short lines.`;
 }
 
 function fileStopMessage(reportFile, report) {
@@ -573,7 +595,7 @@ function fileStopMessage(reportFile, report) {
   return (
     "feature-loop-skill FINAL attestation missing." +
     problem +
-    ` Before ending: write the mandatory FINAL report to ${at} with the skyline create tool (overwrite:true if it exists), then print only \`FINAL stored: ${reportFile}\` plus at most 2 short lines in chat; the report goes in the file, not in chat. The report must carry: ` +
+    ` Before ending: write the mandatory FINAL report to ${at} with the skyline create tool (overwrite:true if it exists) keeping the CHECKPOINT lines already in it verbatim, then print only \`FINAL stored: ${reportFile}\` plus at most 2 short lines in chat; the report goes in the file, not in chat. A CHECKPOINT line counts as live only when an earlier tool call of its own appended it to this file (or it was printed in chat at the time). The report must carry: ` +
     FINAL_FIELDS_DEMAND
   );
 }
@@ -617,9 +639,9 @@ function main() {
     const reportFile = reportPath(input);
     let report = null;
     if (reportFile) {
-      report = checkReportFile(reportFile);
+      report = checkReportFile(reportFile, text);
       if (report.state === "ok") {
-        pruneReports(path.dirname(reportFile), path.basename(reportFile));
+        pruneReports(path.dirname(reportFile), currentSessionNames(input, reportFile));
         process.exit(0);
       }
     }

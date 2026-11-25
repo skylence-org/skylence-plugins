@@ -519,17 +519,41 @@ const POSIX_NON_ROOT = process.platform !== "win32" && !(process.getuid && proce
 // Report dir nested two levels under the temp root, so an unsanitized
 // "../../x" join still lands inside this test's own temp tree (decoys).
 // stop()/commit() default the report dir to this fixture's; pass
-// sessionId null to omit session_id from the payload.
+// sessionId null to omit session_id from the payload. The default
+// transcript carries the live CHECKPOINT appends for VALID_REPORT's lines
+// (1.5.37 C2), so a valid report passes; addLive() adds them for another path.
+
+// 1.5.37 C2: the build-time trail of live CHECKPOINT appends, one tool_use
+// per line, in the skyline edit shape (anchor header names the report path).
+function liveWrites(reportPath, lines = ["CHECKPOINT: post-model = done", "CHECKPOINT: pre-final = done"]) {
+  return lines.map((l) =>
+    line({
+      type: "assistant",
+      message: {
+        content: [
+          {
+            type: "tool_use",
+            name: "mcp__skyline__edit",
+            input: { patch: `¶${reportPath}#AB12\ninsert tail:\n+${l}` },
+          },
+        ],
+      },
+    })
+  );
+}
+
 function reportFixture(t, tag, entries) {
   const tmp = freshTmp();
   const dir = path.join(tmp, "a", "b", "reports");
   fs.mkdirSync(dir, { recursive: true });
   const sid = uniqueSessionId(tag);
+  const report = path.join(dir, `${sid}.md`);
   const transcript = writeTranscript(
     tmp,
     entries || [
       assistantSkillInvoke("feature-loop-skill"),
       assistantGitCommit(),
+      ...liveWrites(report),
       assistantText("still working on the next slice"),
     ]
   );
@@ -545,7 +569,11 @@ function reportFixture(t, tag, entries) {
     dir,
     sid,
     transcript,
-    report: path.join(dir, `${sid}.md`),
+    report,
+    // Live CHECKPOINT appends for another report path (another sid or dir).
+    addLive(reportPath, lines) {
+      fs.appendFileSync(transcript, liveWrites(reportPath, lines).join("\n") + "\n");
+    },
     stop(env, sessionId, cwd) {
       return runHook("stop", payload(sessionId), { SKYLINE_LOOP_REPORT_DIR: dir, ...(env || {}) }, cwd);
     },
@@ -736,6 +764,7 @@ test("report file (8): session ids with path characters are sanitized; the file 
     assert.equal(r.code, 2, `${raw}: a decoy outside the sanitized name must not be read`);
     assert.ok(r.err.includes(`\`${inside}\``), r.err);
     fs.writeFileSync(inside, VALID_REPORT);
+    fx.addLive(inside);
     r = fx.stop({}, raw);
     assert.equal(r.code, 0, `${raw}: the report at the sanitized name inside the dir satisfies the gate`);
   }
@@ -751,6 +780,7 @@ test("report file (8): session ids with path characters are sanitized; the file 
   assert.equal(path.dirname(m[1]), fx.dir, "inside the report dir");
   assert.equal(path.basename(m[1]), `${longName}.md`);
   fs.writeFileSync(m[1], VALID_REPORT);
+  fx.addLive(m[1]);
   assert.equal(fx.stop({}, long).code, 0);
 });
 
@@ -778,6 +808,7 @@ test("report file (8c): distinct raw ids never share a file (a/b vs a_b); a UUID
   fx.track(plain);
   fx.track(sidName(slashed));
   fs.writeFileSync(path.join(fx.dir, `${plain}.md`), VALID_REPORT);
+  fx.addLive(path.join(fx.dir, `${plain}.md`));
   assert.equal(fx.stop({}, plain).code, 0, "an unchanged id reads <id>.md");
   const r = fx.stop({}, slashed);
   assert.equal(r.code, 2, "a/b must not read a_b's report");
@@ -934,6 +965,7 @@ test("report file (11b): a report dir that is a symlink to a notes dir loses not
   put("old-headerless.md", 40, VALID_REPORT.replace("loop-report: v1\n", ""));
   put("old-report.md", 40, VALID_REPORT);
   put(`${fx.sid}.md`, 0, VALID_REPORT);
+  fx.addLive(path.join(linkDir, `${fx.sid}.md`));
   const r = fx.stop({ SKYLINE_LOOP_REPORT_DIR: linkDir });
   assert.equal(r.code, 0);
   assert.deepEqual(
@@ -1297,4 +1329,240 @@ test("not-emitted (o): a not-emitted line plus 256 KB of blank lines is checked 
   missingFields(finalWith("Deviations:" + " \n".repeat(131072)));
   const ms = Number(process.hrtime.bigint() - start) / 1e6;
   assert.ok(ms < 500, `took ${ms} ms`);
+});
+
+// --- 1.5.37: per-kind report files (debug, review) beside the FINAL --------
+
+test("Q3 (a): retention prunes other sessions' old headered .debug.md / .review.md; the current session's three files are kept", (t) => {
+  const fx = reportFixture(t, "q3a");
+  const at = (name) => path.join(fx.dir, name);
+  const headered = (kind) => `# ${kind}-loop REPORT\nloop-report: v1\nroot cause: x\n`;
+  const writeAged = (name, days, body) => {
+    fs.writeFileSync(at(name), body);
+    age(at(name), days);
+  };
+  fs.writeFileSync(fx.report, VALID_REPORT);
+  writeAged(`${fx.sid}.debug.md`, 40, headered("debug"));
+  writeAged(`${fx.sid}.review.md`, 40, headered("review"));
+  writeAged("other-session.debug.md", 40, headered("debug"));
+  writeAged("other-session.review.md", 40, headered("review"));
+  writeAged("recent-session.debug.md", 5, headered("debug"));
+  writeAged("headerless.review.md", 40, "# review notes\n");
+
+  const r = fx.stop();
+  assert.equal(r.code, 0, r.err);
+  assert.equal(fs.existsSync(at("other-session.debug.md")), false, "old headered debug report pruned");
+  assert.equal(fs.existsSync(at("other-session.review.md")), false, "old headered review report pruned");
+  assert.ok(fs.existsSync(at("recent-session.debug.md")), "5-day-old debug report kept");
+  assert.ok(fs.existsSync(at("headerless.review.md")), "headerless review file kept");
+  assert.ok(fs.existsSync(at(`${fx.sid}.debug.md`)), "current session's debug report kept, however old");
+  assert.ok(fs.existsSync(at(`${fx.sid}.review.md`)), "current session's review report kept, however old");
+  assert.ok(fs.existsSync(fx.report));
+});
+
+test("Q3 (b): the Stop gate reads <sid>.md only: a valid FINAL in <sid>.debug.md / <sid>.review.md does not pass", (t) => {
+  const fx = reportFixture(t, "q3b");
+  fs.writeFileSync(path.join(fx.dir, `${fx.sid}.debug.md`), VALID_REPORT);
+  fs.writeFileSync(path.join(fx.dir, `${fx.sid}.review.md`), VALID_REPORT);
+  const r = fx.stop();
+  assert.equal(r.code, 2, "no FINAL file: blocks");
+  assert.ok(r.err.includes(`write the mandatory FINAL report to \`${fx.report}\``), r.err);
+  assert.doesNotMatch(r.err, /\.debug\.md|\.review\.md/, "never names a debug/review file");
+});
+
+// --- 1.5.37 C2: CHECKPOINT lines go to the report file, written live -------
+
+function toolUse(name, input) {
+  return line({ type: "assistant", message: { content: [{ type: "tool_use", name, input }] } });
+}
+
+function finalCreate(reportPath, content = VALID_REPORT) {
+  return toolUse("mcp__skyline__create", { path: reportPath, content, overwrite: true });
+}
+
+// Fixture whose transcript is built from the fixture's own report path.
+function orderedFixture(t, tag, entriesFor, content = VALID_REPORT) {
+  const fx = reportFixture(t, tag);
+  fs.writeFileSync(
+    fx.transcript,
+    [assistantSkillInvoke("feature-loop-skill"), assistantGitCommit(), ...entriesFor(fx.report)].join("\n") + "\n"
+  );
+  fs.writeFileSync(fx.report, content);
+  return fx;
+}
+
+test("C2 (1): CHECKPOINT lines appended live by their own calls, then the FINAL create: Stop passes", (t) => {
+  const fx = orderedFixture(t, "c2-1", (r) => [...liveWrites(r), finalCreate(r)]);
+  const r = fx.stop();
+  assert.equal(r.code, 0, r.err);
+  assert.equal(r.err, "");
+});
+
+test("C2 (2): FINAL written in one create with its CHECKPOINT lines, no earlier write: blocks checkpoint-not-live, names the lines", (t) => {
+  const fx = orderedFixture(t, "c2-2", (r) => [finalCreate(r)]);
+  const r = fx.stop();
+  assert.equal(r.code, 2);
+  assert.ok(r.err.includes(`The report file \`${fx.report}\` is missing fields: checkpoint-not-live.`), r.err);
+  assert.ok(
+    r.err.includes("no live write before the FINAL write: `CHECKPOINT: post-model = done`, `CHECKPOINT: pre-final = done`."),
+    r.err
+  );
+  assert.match(r.err, /`CHECKPOINT: <name> = not-emitted`, named under deviations/);
+  assert.doesNotMatch(r.err, /may trail/, "the FINAL write is visible: definitive wording");
+});
+
+test("C2 (2b): CHECKPOINT appends AFTER the FINAL write do not count as live", (t) => {
+  const fx = orderedFixture(t, "c2-2b", (r) => [finalCreate(r), ...liveWrites(r)]);
+  const r = fx.stop();
+  assert.equal(r.code, 2);
+  assert.match(r.err, /is missing fields: checkpoint-not-live\./);
+});
+
+test("C2 (3): CHECKPOINT lines printed in chat earlier (the pre-1.5.37 habit) plus a file FINAL: Stop passes", (t) => {
+  const fx = orderedFixture(t, "c2-3", (r) => [
+    assistantText("CHECKPOINT: post-model = done"),
+    assistantText("slice 2 committed\nCHECKPOINT: pre-final = done"),
+    finalCreate(r),
+  ]);
+  assert.equal(fx.stop().code, 0);
+});
+
+test("C2 (4): a `= not-emitted` line needs no live write; only the live ones are checked", (t) => {
+  const report = VALID_REPORT.replace("CHECKPOINT: pre-final = done", "CHECKPOINT: pre-final = not-emitted").replace(
+    "deviations from this skill: None",
+    "deviations from this skill: pre-final checkpoint not emitted live"
+  );
+  const fx = orderedFixture(t, "c2-4", (r) => [...liveWrites(r, ["CHECKPOINT: post-model = done"]), finalCreate(r, report)], report);
+  const r = fx.stop();
+  assert.equal(r.code, 0, r.err);
+});
+
+test("C2 (5): FINAL write not in the transcript (it trails the file): blocks with the stop-again-unchanged wording", (t) => {
+  const fx = orderedFixture(t, "c2-5", () => []);
+  const r = fx.stop();
+  assert.equal(r.code, 2);
+  assert.match(r.err, /is missing fields: checkpoint-not-live\./);
+  assert.match(r.err, /may trail the file: if each line was appended by its own call before the FINAL write, stop again without changing those lines/);
+});
+
+test("C2 (6): line key = name + state + an immediately following (reason); trailing text, tree glyphs and quotes do not break it", (t) => {
+  const report = VALID_REPORT.replace(
+    "│  CHECKPOINT: post-model = done",
+    "│  **CHECKPOINT: post-model = done** (advisor: approve, 3 notes)"
+  ).replace("│  CHECKPOINT: pre-final = done", '│  CHECKPOINT: pre-final = skipped(no "advisor" tool)');
+  const live = [
+    toolUse("mcp__skyline__create", {
+      path: "IGNORED",
+      content: "# feature-loop FINAL\nloop-report: v1\nCHECKPOINT: post-model = done\n",
+      target: "",
+    }),
+  ];
+  // The create above names no path: not live. The two below name it.
+  const fx = orderedFixture(
+    t,
+    "c2-6",
+    (r) => [
+      ...live,
+      toolUse("Write", { file_path: r, content: "# feature-loop FINAL\nloop-report: v1\ncheckpoint:  POST-MODEL = done\n" }),
+      toolUse("Bash", { command: `printf '%s\\n' 'CHECKPOINT: pre-final = skipped(no "advisor" tool)' >> ${r}` }),
+      finalCreate(r, report),
+    ],
+    report
+  );
+  assert.equal(fx.stop().code, 0);
+
+  const other = orderedFixture(
+    t,
+    "c2-6b",
+    (r) => [...liveWrites(r, ["CHECKPOINT: post-model = done", "CHECKPOINT: pre-final = skipped(other reason)"]), finalCreate(r, report)],
+    report
+  );
+  const r = other.stop();
+  assert.equal(r.code, 2, "a different (reason) is a different line");
+  assert.ok(r.err.includes('`CHECKPOINT: pre-final = skipped(no "advisor" tool)`'), r.err);
+  assert.ok(!r.err.includes("`CHECKPOINT: post-model = done`"), "the live post-model line is not listed");
+});
+
+test("C2 (7): a write naming another path (<report>.bak, a longer path) is not a live write to the report", (t) => {
+  const fx = orderedFixture(t, "c2-7", (r) => [
+    ...liveWrites(`${r}.bak`),
+    ...liveWrites(`${r}x`),
+    ...liveWrites(`/x${r}`),
+    finalCreate(r),
+  ]);
+  const r = fx.stop();
+  assert.equal(r.code, 2);
+  assert.match(r.err, /no live write before the FINAL write/);
+});
+
+test("C2 (8): commit reminder in file mode tells the model to append each CHECKPOINT line to the report file; chat mode is the legacy string", (t) => {
+  const fx = reportFixture(t, "c2-8", [assistantSkillInvoke("feature-loop-skill")]);
+  const ctx = (r) => JSON.parse(r.out).hookSpecificOutput.additionalContext;
+  const fileCtx = ctx(fx.commit());
+  assert.ok(fileCtx.startsWith(LEGACY_COMMIT_CONTEXT + " "), fileCtx);
+  assert.ok(fileCtx.includes(`CHECKPOINT lines go to the report file \`${fx.report}\`, not chat`), fileCtx);
+  assert.match(fileCtx, /append each one by its own tool call the moment it resolves/);
+  assert.match(fileCtx, /keeping the CHECKPOINT lines already in it verbatim/);
+  assert.equal(ctx(fx.commit({ SKYLINE_LOOP_REPORT: "chat" })), LEGACY_COMMIT_CONTEXT);
+});
+
+test("C2 (9): chat mode ignores the ordering check: a FINAL with CHECKPOINT lines in chat passes as before", (t) => {
+  const fx = reportFixture(t, "c2-9", [
+    assistantSkillInvoke("feature-loop-skill"),
+    assistantGitCommit(),
+    assistantText(FINAL_ATTESTATION_TEXT),
+  ]);
+  for (const mode of ["chat", undefined]) assert.equal(fx.stop({ SKYLINE_LOOP_REPORT: mode }).code, 0, `mode ${mode}`);
+});
+
+test("C2 (10): a live append whose reason says 'test counts' is not the FINAL write (the mark is read outside CHECKPOINT lines)", (t) => {
+  const reason = "CHECKPOINT: pre-final = skipped(docs only, test counts unchanged, slices shipped earlier)";
+  const report = VALID_REPORT.replace("│  CHECKPOINT: pre-final = done", `│  ${reason}`);
+  const fx = orderedFixture(
+    t,
+    "c2-10",
+    (r) => [...liveWrites(r, ["CHECKPOINT: post-model = done", reason]), finalCreate(r, report)],
+    report
+  );
+  const r = fx.stop();
+  assert.equal(r.code, 0, r.err);
+});
+
+// Bounce 1 M1: skyline create answers with the REALPATH anchor (/var ->
+// /private/var on macOS, a symlinked report dir), and the model's later edit
+// appends carry that form. Those are live writes to the same file.
+test("C2 (11): live CHECKPOINT edits that carry the realpath anchor of a symlinked report dir count as live", (t) => {
+  const fx = reportFixture(t, "c2-11");
+  const link = path.join(fx.tmp, "reports-link");
+  if (!trySymlink(fx.dir, link)) {
+    t.skip("symlinks not permitted on this platform");
+    return;
+  }
+  const literal = path.join(link, `${fx.sid}.md`);
+  const real = path.join(fs.realpathSync(fx.dir), `${fx.sid}.md`);
+  assert.notEqual(real, literal, "the fixture really goes through a symlink");
+  fs.writeFileSync(fx.report, VALID_REPORT);
+  const write = (entries) =>
+    fs.writeFileSync(
+      fx.transcript,
+      [assistantSkillInvoke("feature-loop-skill"), assistantGitCommit(), ...entries].join("\n") + "\n"
+    );
+  // FINAL created under the literal path the gate named.
+  write([...liveWrites(real), finalCreate(literal)]);
+  let r = fx.stop({ SKYLINE_LOOP_REPORT_DIR: link });
+  assert.equal(r.code, 0, r.err);
+  // FINAL appended by an edit that also carries the realpath anchor.
+  fs.rmSync(counterFile(fx.sid), { force: true });
+  write([
+    ...liveWrites(real),
+    toolUse("mcp__skyline__edit", { patch: `¶${real}#CD34\ninsert tail:\n+${VALID_REPORT}` }),
+  ]);
+  r = fx.stop({ SKYLINE_LOOP_REPORT_DIR: link });
+  assert.equal(r.code, 0, r.err);
+  // Reconstruction is still caught under the realpath form.
+  fs.rmSync(counterFile(fx.sid), { force: true });
+  write([toolUse("mcp__skyline__edit", { patch: `¶${real}#EF56\ninsert tail:\n+${VALID_REPORT}` }), ...liveWrites(real)]);
+  r = fx.stop({ SKYLINE_LOOP_REPORT_DIR: link });
+  assert.equal(r.code, 2);
+  assert.match(r.err, /no live write before the FINAL write/);
 });

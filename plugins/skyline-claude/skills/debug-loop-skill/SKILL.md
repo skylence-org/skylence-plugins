@@ -37,4 +37,9 @@ FIX:
   regression test in SAME change — red before fix, green after; symptom without test coverage gets coverage now
   diagnostics(batch) → full suite via test tool → formatter via run → git_commit
 
-REPORT: root cause (mechanism, not narrative) + falsified-hypothesis trail + fix location + regression test name + suite counts. Cause worth remembering machine-wide ⇒ lore_mark(kind=fact, why= names expected-instead); fix invalidates older mark ⇒ lore_mark replacement then lore_supersede(old, new), never leave stale mark outranking truth.
+REPORT (file = full report, chat = 1–3 lines):
+  ├─ path = the debug REPORT path the primer named (SessionStart) ⇒ create(path, overwrite:true), one per line: `# debug-loop REPORT` → `loop-report: v1` → `repo: <abs root>` → `branch: <name>` → `date: <UTC ISO>` → root cause (mechanism, not narrative) → falsified-hypothesis trail → fix location → regression test name → suite counts → `skylore: <nothing durable | marked <ids>>` at column 0, no tree glyph
+  ├─ chat = 1–3 lines: root cause; fix location + regression test name; suite status
+  ├─ no path given (primer absent, `SKYLINE_LOOP_REPORT=chat`, another harness) ⇒ full REPORT in chat as before
+  └─ dispatch brief names a destination (board comment, PR body) ⇒ post there as well; still write the report file (path given ⇒ the file is never skipped)
+Cause worth remembering machine-wide ⇒ lore_mark(kind=fact, why= names expected-instead); fix invalidates older mark ⇒ lore_mark replacement then lore_supersede(old, new), never leave stale mark outranking truth.

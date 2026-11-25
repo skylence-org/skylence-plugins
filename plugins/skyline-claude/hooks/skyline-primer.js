@@ -1,8 +1,10 @@
 /**
  * SessionStart primer (skylence-plugins#20 R3).
  * Arms the agent with the right first-tool guidance for symbol questions at session start.
- * Reads stdin JSON; looks for top-level "cwd".
+ * Reads stdin JSON; looks for top-level "cwd" and "session_id".
  * Emits ONLY additionalContext on SessionStart hook (no permission decision).
+ * 1.5.37: in loop-report file mode also names this session's three loop
+ * report files (loopReportBlock), on every SessionStart source.
  * Fail-open on any error/parse/fs: exit 0, no output.
  */
 
@@ -267,14 +269,51 @@ function blueprintInvocationContext(cwd) {
     " (Skill tool) at plan time, before the first edit."
   );
 }
+
+// 1.5.37: name this session's loop report files at EVERY SessionStart
+// (startup, resume, clear, compact: hooks.json wires the primer with no
+// matcher, so the block survives compaction), so the debug, review and
+// feature loops know where their reports go and chat keeps only the short
+// summary. File mode only: SKYLINE_LOOP_REPORT=chat, an unusable session_id
+// or no home dir add nothing (loop-report-path.js decides all three, the same
+// helper the loop gate reads with). Required lazily: a failure here must not
+// cost the rest of the primer.
+const LOOP_REPORT_RULE =
+  "Loop reports (feature FINAL, debug REPORT, review evidence) go to these files; chat gets the short summary the skill names. feature-loop CHECKPOINT lines are appended to the FINAL file, each by its own call, the moment they resolve.";
+
+function loopReportBlock(sessionId) {
+  try {
+    const { reportPaths } = require("./loop-report-path");
+    const p = reportPaths(sessionId);
+    if (!p) return "";
+    return `Loop report files for this session: feature FINAL \`${p.final}\`, debug REPORT \`${p.debug}\`, review evidence \`${p.review}\`. ${LOOP_REPORT_RULE}`;
+  } catch (_e) {
+    return "";
+  }
+}
+
+// Bounce 1 M3: retention also runs here (one shared implementation in
+// loop-report-path.js), so a box that only runs debug / review / non-loop
+// sessions does not grow its report dir without bound. Same rules as the
+// gate's pass-time prune: file mode with a usable session_id only, never this
+// session's three files, best effort, errors swallowed.
+function pruneOldReports(sessionId) {
+  try {
+    require("./loop-report-path").pruneForSession(sessionId);
+  } catch (_e) {
+    /* best-effort */
+  }
+}
 let buf = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (d) => (buf += d));
 process.stdin.on("end", () => {
   let cwd = "";
+  let sessionId;
   try {
     const input = JSON.parse(buf || "{}");
     cwd = input.cwd == null ? "" : String(input.cwd);
+    sessionId = input.session_id;
   } catch (_e) {
     process.exit(0); // malformed => silent exit 0
   }
@@ -334,6 +373,11 @@ process.stdin.on("end", () => {
   }
   if (context) {
     parts.push(context);
+  }
+  const reportBlock = loopReportBlock(sessionId);
+  pruneOldReports(sessionId);
+  if (reportBlock) {
+    parts.push(reportBlock);
   }
   context = parts.join("\n\n");
 

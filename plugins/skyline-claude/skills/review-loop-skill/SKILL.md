@@ -32,4 +32,9 @@ FINDINGS:
   severity: breaks-correctness > silent-drift > missing-coverage > efficiency > style (style only if asked)
   verified-nothing-found = valid result; state what was checked, never manufacture findings
 
-REPORT: verdict (approve / bounce with findings) + verification evidence (commands re-run, counts seen) + findings list. Recurring defect class worth remembering ⇒ lore_mark(kind=fact).
+REPORT (file = evidence, chat = verdict + findings):
+  ├─ path = the review evidence path the primer named (SessionStart) ⇒ create(path, overwrite:true), one per line: `# review-loop REPORT` → `loop-report: v1` → `repo: <abs root>` → `branch: <name>` → `date: <UTC ISO>` → verification evidence (commands re-run, counts seen) → full findings detail (anchor, defect, failure scenario) → `skylore: <nothing durable | marked <ids>>` at column 0, no tree glyph
+  ├─ chat = verdict (approve / bounce with findings) + ONE line per finding (severity, file:line, what); findings stay in chat: they are the deliverable
+  ├─ no path given (primer absent, `SKYLINE_LOOP_REPORT=chat`, another harness) ⇒ full REPORT in chat as before
+  └─ dispatch brief names a destination (board comment, PR body) ⇒ post there as well; still write the report file (path given ⇒ the file is never skipped)
+Recurring defect class worth remembering ⇒ lore_mark(kind=fact).
