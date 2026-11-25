@@ -15,20 +15,28 @@
 # The reader of this script's output can go away mid-run: an agent's skyline
 # `run` call makes this script a child of the daemon it restarts, and the
 # daemon's pipes close when it exits. So:
-#   - SIGPIPE is ignored, and a closed stdout/stderr is reopened on /dev/null;
-#     in a step file (a command substitution only when no directory is
-#     writable), and the shell then copies it to the log and relays it;
-#     in a step file, which is copied to the log and then relayed;
+#   - SIGPIPE is ignored, and a closed stdout/stderr is reopened on /dev/null.
+#     The trap matters even though the shell never writes stdout itself:
+#     bash reports a child killed by a signal on its own stderr;
+#   - every step runs with stdin /dev/null and its output in a step file of
+#     this run's own (upgrade-step.<pid>.out; a command substitution only when
+#     no directory is writable), which the shell copies to the log and then
+#     relays;
 #   - the shell itself never writes to stdout (a failed builtin write in bash
 #     leaves its buffer to leak into the next redirect): every line goes to
 #     the log, then to stdout through `cat`, whose failures are ignored;
-#   - the closing text and the exit code always go to the summary file, which
-#     says "has not finished" until then.
+#   - the summary file's first line names this run's start time (UTC) and pid.
+#     Until the closing text and the exit code replace it, it says "has not
+#     finished" with the last step started and the last step finished. It is
+#     always replaced whole (a temp file, then a rename), so a reader never
+#     sees it empty or cut off.
 # The log and summary live in ${XDG_CACHE_HOME:-$HOME/.cache}/skyline/
 # (upgrade.log, upgrade-summary.txt), or in ${TMPDIR:-/tmp} (skyline-
-# prefixed) when that cannot be written; their paths are printed first. Writes
-# to them are best effort and never change the outcome or the exit code.
-# Keep the body POSIX sh (the test runs it under bash, sh and dash).
+# prefixed) when that cannot be written; their paths are printed first. A
+# previous run's log and summary there are removed first. Overlapping runs
+# share the log and the summary (the later write wins), never a step file.
+# Writes to them are best effort and never change the outcome or the exit
+# code. Keep the body POSIX sh (the test runs it under bash, sh and dash).
 
 trap '' PIPE
 (true 3>&1) 2>/dev/null || exec 1>/dev/null
@@ -38,14 +46,33 @@ PORT=7333
 failed=""
 LOG=/dev/null
 SUMMARY=""
+SUMTMP=""
 STEP=/dev/null
 NL='
 '
+# When this run started (UTC, ISO 8601). With the pid it opens every summary
+# state, so a reader can tell this run's summary from a previous run's.
+STARTED=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)
+[ -n "$STARTED" ] || STARTED="at an unknown time"
+run_line() {
+  printf '%s' "skyline upgrade started $STARTED (pid $$)."
+}
 
 # The summary file's text until the run finishes: a run the daemon restart
 # (or anything else) stops early leaves this, never a previous run's result.
 started_text() {
-  printf '%s' "skyline upgrade started (pid $$) and has not finished. If this is still the text after the upgrade call returned, wait a few seconds and read it again. If it still does not change, the script was stopped before its summary (a daemon restart can stop it): the upgrade is NOT confirmed. Full output so far: $LOG"
+  printf '%s' "$(run_line)${NL}This run has not finished. If this is still the text after the upgrade call returned, wait a few seconds and read it again (ps -p $$ shows whether the script still runs). If it does not change and the script is gone, it was stopped before its summary (a daemon restart can stop it): the upgrade is NOT confirmed. Full output so far: $LOG"
+}
+# put_summary <text>: replace the summary file whole (a temp file in the same
+# directory, then a rename), so a reader never sees it empty or cut off. The
+# temp file's name is no summary's, and it is removed when either step fails.
+put_summary() {
+  [ -n "$SUMMARY" ] || return 0
+  if printf '%s\n' "$1" 2>/dev/null >"$SUMTMP" && mv -f "$SUMTMP" "$SUMMARY" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$SUMTMP" 2>/dev/null
+  return 1
 }
 # progress/finished: rewrite the "has not finished" text with the last step
 # started and the last step finished (ruling 1611), so a run stopped
@@ -61,19 +88,25 @@ finished() {
   write_progress
 }
 write_progress() {
-  [ -n "$SUMMARY" ] || return 0
-  printf '%s\nLast step started: %s\nLast step finished: %s\n' "$(started_text)" "$last_started" "$last_finished" \
-    2>/dev/null >"$SUMMARY"
+  put_summary "$(started_text)${NL}Last step started: $last_started${NL}Last step finished: $last_finished"
 }
 
+# use_dir <dir> <prefix>: this run's log, summary and step file in <dir>. A
+# previous run's log and summary go first: one this user cannot rewrite (mode
+# 0444, or another user's) would otherwise send this run to the fallback
+# directory and leave that run's "Upgrade complete." at this path.
 use_dir() {
   mkdir -p "$1" 2>/dev/null || return 1
+  rm -f "$1/${2}upgrade.log" "$1/${2}upgrade-summary.txt" 2>/dev/null
   LOG="$1/${2}upgrade.log"
   SUMMARY="$1/${2}upgrade-summary.txt"
-  STEP="$1/${2}upgrade-step.out"
-  printf '' 2>/dev/null >"$LOG" || return 1
-  printf '' 2>/dev/null >"$STEP" || return 1
-  printf '%s\n' "$(started_text)" 2>/dev/null >"$SUMMARY" || return 1
+  SUMTMP="$1/${2}upgrade-write.$$.tmp"
+  STEP="$1/${2}upgrade-step.$$.out"
+  if printf '' 2>/dev/null >"$LOG" && printf '' 2>/dev/null >"$STEP" && write_progress; then
+    return 0
+  fi
+  rm -f "$STEP" 2>/dev/null
+  return 1
 }
 if use_dir "${XDG_CACHE_HOME:-$HOME/.cache}/skyline" ""; then
   true
@@ -82,6 +115,7 @@ elif use_dir "${TMPDIR:-/tmp}" "skyline-"; then
 else
   LOG=/dev/null
   SUMMARY=""
+  SUMTMP=""
   STEP=/dev/null
 fi
 
@@ -114,13 +148,11 @@ log_step() {
 show_step() {
   [ -z "$STEP_OUT" ] || say "$STEP_OUT"
 }
-# finish <closing text> <exit code> [quiet]: the summary file gets the closing
-# text plus the exit code before anything else; stdout gets the text unless
-# it was already printed (quiet).
+# finish <closing text> <exit code> [quiet]: the summary file gets the run
+# line, the closing text and the exit code before anything else; stdout gets
+# the text unless it was already printed (quiet).
 finish() {
-  if [ -n "$SUMMARY" ]; then
-    printf '%s\nexit code: %s\n' "$1" "$2" 2>/dev/null >"$SUMMARY"
-  fi
+  put_summary "$(run_line)${NL}$1${NL}exit code: $2"
   [ "${3:-}" = quiet ] || say "$1"
   [ "$STEP" = /dev/null ] || rm -f "$STEP" 2>/dev/null
   exit "$2"
@@ -138,9 +170,9 @@ skyline_version() {
 }
 
 if [ -n "$SUMMARY" ]; then
-  say "skyline upgrade: summary file $SUMMARY, full log $LOG. If this output stops early, read the summary file."
+  say "skyline upgrade started $STARTED (pid $$): summary file $SUMMARY, full log $LOG. If this output stops early, read the summary file."
 else
-  say "skyline upgrade: no writable directory for the summary and log files; this output is the only record."
+  say "skyline upgrade started $STARTED (pid $$): no writable directory for the summary and log files; this output is the only record."
 fi
 
 if ! command -v skyline >/dev/null 2>&1; then

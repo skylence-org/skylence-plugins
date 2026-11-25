@@ -18,14 +18,14 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 SCRIPT="${UPGRADE_SH:-$HERE/upgrade.sh}"
 SHELLS="${UPGRADE_TEST_SHELLS:-bash sh}"
 ROOT=$(mktemp -d "${TMPDIR:-/tmp}/skyline-upgrade-test.XXXXXX")
-trap 'rm -rf "$ROOT"' EXIT
+trap 'chmod -R u+w "$ROOT" 2>/dev/null; rm -rf "$ROOT"' EXIT
 
 # PATH inside each case is ONLY the fakes plus symlinks to the tools
 # upgrade.sh and the fakes use, so a real skyline/npm can never be reached
 # (not even one installed under /usr/bin), including in the no-skyline case.
 TOOLS="$ROOT/tools"
 mkdir -p "$TOOLS"
-for t in head sed grep cat cp mkdir rm sleep; do
+for t in head sed grep cat cp mkdir rm sleep mv date ln; do
   p=$(command -v "$t") || { echo "missing tool: $t"; exit 1; }
   ln -s "$p" "$TOOLS/$t"
 done
@@ -35,6 +35,11 @@ fail=0
 HINT="claude plugin marketplace update skylence-plugins"
 OLD_BANNER="skyline binary updated and daemon restarted."
 FULL_CALLS="skyline update --check | npm i -g @skylence-ai/skyline@latest | skyline setup | skyline daemon restart --port 7333"
+# A previous run's finished summary (the stale=1 and f444=1 cases).
+STALE_SUMMARY='skyline upgrade started 2000-01-01T00:00:00Z (pid 1).
+Upgrade complete.
+exit code: 0'
+RUN_LINE_RE='^skyline upgrade started [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z \(pid [0-9]+\)\.$'
 
 ok() { pass=$((pass + 1)); }
 bad() {
@@ -60,12 +65,35 @@ calls_are() {
   got=$(grep -v -- ' --version$' "$STATE/calls" 2>/dev/null | tr '\n' '|' | sed 's/|$//; s/|/ | /g')
   if [ "$got" = "$1" ]; then ok; else bad "calls were: [$got] expected: [$1]"; fi
 }
-# The summary file is the closing text of stdout plus "exit code: <rc>".
+# header_ok: the summary's first line names this run's start (UTC) and pid,
+# the same ones as stdout's first line (when there is a stdout).
+header_ok() {
+  h=$(head -n 1 "$SUMF" 2>/dev/null)
+  if printf '%s\n' "$h" | grep -Eq "$RUN_LINE_RE"; then ok; else bad "summary first line [$h] is not the run line"; fi
+  first=$(head -n 1 "$OUT" 2>/dev/null)
+  case "$first" in
+    "skyline upgrade started "*)
+      if [ "${first%%): *})." = "$h" ]; then ok; else bad "summary run line [$h] is not stdout's [$first]"; fi ;;
+  esac
+}
+# first_line_ok <rest>: stdout's first line is the run's start and pid, then
+# <rest>.
+first_line_ok() {
+  got=$(head -n 1 "$OUT")
+  if printf '%s\n' "$got" | grep -Eq '^skyline upgrade started [0-9TZ:-]+ \(pid [0-9]+\): ' && [ "${got#*): }" = "$1" ]; then
+    ok
+  else
+    bad "first line was: [$got]"
+  fi
+}
+# The summary file is the run line, the closing text of stdout, then
+# "exit code: <rc>".
 summary_ok() {
   if [ ! -f "$SUMF" ]; then bad "no summary file at $SUMF"; return; fi
   got=$(tail -n 1 "$SUMF")
   if [ "$got" = "exit code: $RC" ]; then ok; else bad "summary last line [$got], rc $RC"; fi
-  body=$(sed '$d' "$SUMF")
+  header_ok
+  body=$(sed '1d;$d' "$SUMF")
   if grep -q '^To update the skyline-claude plugin:$' "$OUT"; then
     want=$(sed -n '/^To update the skyline-claude plugin:$/,$p' "$OUT")
   else
@@ -73,11 +101,19 @@ summary_ok() {
   fi
   if [ "$body" = "$want" ]; then ok; else bad "summary file is not the closing text of stdout"; fi
 }
+# summary_is <text>: the summary file is the run line, then <text>.
 summary_is() {
-  if [ "$(cat "$SUMF" 2>/dev/null)" = "$1" ]; then ok; else bad "summary file differs from the expected text"; fi
+  header_ok
+  if [ "$(sed 1d "$SUMF" 2>/dev/null)" = "$1" ]; then ok; else bad "summary file differs from the expected text"; fi
 }
 summary_has() { if grep -qF -- "$1" "$SUMF" 2>/dev/null; then ok; else bad "expected summary file to contain: $1"; fi; }
 log_has() { if grep -qF -- "$1" "$LOGF" 2>/dev/null; then ok; else bad "expected log $LOGF to contain: $1"; fi; }
+# cache_clean <dir>: after a finished run only the log and the summary are
+# left there: no step file, no temp file.
+cache_clean() {
+  left=$(ls -A "$1" 2>/dev/null | grep -vxF -e upgrade.log -e upgrade-summary.txt | tr '\n' ' ')
+  if [ -z "$left" ]; then ok; else bad "left behind in $1: $left"; fi
+}
 
 write_fakes() {
   bin="$1"
@@ -89,8 +125,35 @@ echo "skyline $*" >>"$S/calls"
 v=$(cat "$S/version")
 mode=$(cat "$S/mode")
 rcfile() { if [ -f "$S/$1" ]; then cat "$S/$1"; else echo 0; fi; }
+# sync_point <step>: hand over to another run at marker files (the overlap
+# cases): touch the file named in <step>_signal, then wait for the one named
+# in <step>_wait. Bounded (~30 s); a timeout leaves sync_timeout, which the
+# test fails on.
+sync_point() {
+  if [ -f "$S/${1}_signal" ]; then : >"$(cat "$S/${1}_signal")"; fi
+  if [ -f "$S/${1}_wait" ]; then
+    w=$(cat "$S/${1}_wait"); i=0
+    while [ ! -f "$w" ]; do
+      i=$((i + 1))
+      if [ "$i" -gt 600 ]; then : >"$S/sync_timeout"; break; fi
+      sleep 0.05
+    done
+  fi
+}
 case "$1 ${2:-}" in
   "--version ")
+    # Stop the script (its pid is in the pid file, io=bg) before its first
+    # step, then wait until it is gone (bounded).
+    if [ -f "$S/term_at_version" ] && [ ! -f "$S/termed" ]; then
+      : >"$S/termed"
+      i=0
+      while [ ! -s "$S/pid" ] && [ "$i" -lt 200 ]; do sleep 0.05; i=$((i + 1)); done
+      p=$(cat "$S/pid")
+      kill -TERM "$p"
+      i=0
+      while kill -0 "$p" 2>/dev/null && [ "$i" -lt 200 ]; do sleep 0.05; i=$((i + 1)); done
+      exit 0
+    fi
     if [ -f "$S/noversion" ]; then :
     elif [ -f "$S/garbage" ]; then echo "warning: deprecated flag"
     elif [ -f "$S/garbage_text" ]; then cat "$S/garbage_text"
@@ -116,11 +179,17 @@ case "$1 ${2:-}" in
     case "$mode" in
       uptodate) echo "Already up to date: $v" ;;
       available) cp "$S/next" "$S/version"; : >"$S/updated"; echo "Installed $(cat "$S/next")" ;;
-      degraded) echo "Update check degraded: authentication required"; echo "Offline or unreachable release endpoint; no upgrade applied." ;;
+      degraded) echo "Update check degraded: authentication required"; sync_point update_yes; echo "Offline or unreachable release endpoint; no upgrade applied." ;;
       hardfail) echo "Error: checking for updates" >&2; echo "HTTP status client error (404 Not Found)" >&2; exit 1 ;;
       npm) echo "skyline is managed by npm. To upgrade, run:" ;;
     esac ;;
   "setup ")
+    sync_point setup
+    # What a reader holding the summary open sees: a hard link to the file as
+    # it is now (the summary-replaced case).
+    if [ -f "$S/snap_at_setup" ]; then ln "$(cat "$S/snap_at_setup")" "$S/snap"; fi
+    # A step killed by a signal (probeT of review M3).
+    if [ -f "$S/term_self_at_setup" ]; then kill -TERM $$; fi
     # A write to a dead pipe fails here (SIGPIPE is ignored by upgrade.sh and
     # stays ignored in its children), which the case sees as a failed setup.
     echo "fake setup done" || exit 7
@@ -153,11 +222,16 @@ EOF
 #   state keys (written to the fakes' state dir): mode version next setup_rc
 #   restart_rc install_rc npm_rc noversion garbage garbage_text
 #   garbage_until_update vprefix kill_at_setup term_at_restart
+#   term_self_at_setup term_at_version (needs io=bg)
 #   special keys: noskyline=1 (no fake skyline), io=closed (stdout+stderr
-#   closed) | io=reader (a reader that takes the first line and exits),
-#   xdg=unset|elsewhere (no XDG_CACHE_HOME, or one outside HOME), xdgfile=1
-#   (XDG_CACHE_HOME is a regular file), tmpfile=1 (so is TMPDIR), stale=1
-#   (a previous run's "Upgrade complete." summary is in place).
+#   closed) | io=reader (a reader that takes the first line and exits) |
+#   io=bg (the script runs in the background, its pid in the state's pid
+#   file), xdg=unset|elsewhere (no XDG_CACHE_HOME, or one outside HOME),
+#   xdgfile=1 (XDG_CACHE_HOME is a regular file), tmpfile=1 (so is TMPDIR),
+#   stale=1 (a previous run's "Upgrade complete." summary is in place),
+#   f444=1 (a previous run's summary and log, both mode 0444), ro=1 (the
+#   cache dir is read-only during the run, so the files go to TMPDIR),
+#   snap=1 (the fake setup hard-links the summary file to state/snap).
 run_case() {
   SH="$1"; CASE="$2"; shift 2
   DIR="$ROOT/$SH-$CASE"
@@ -169,6 +243,8 @@ run_case() {
   echo "1.4.1" >"$STATE/next"
   echo "npm" >"$STATE/mode"
   io=normal
+  RO=0
+  SNAP=0
   XDG="$DIR/home/.cache"
   TMPD="$DIR/tmp"
   SUMF="$DIR/home/.cache/skyline/upgrade-summary.txt"
@@ -190,10 +266,20 @@ run_case() {
         TMPD="$DIR/tmp-is-a-file"; : >"$TMPD"; SUMF="" ; LOGF="" ;;
       stale)
         mkdir -p "$DIR/home/.cache/skyline"
-        printf 'Upgrade complete.\nexit code: 0\n' >"$DIR/home/.cache/skyline/upgrade-summary.txt" ;;
+        printf '%s\n' "$STALE_SUMMARY" >"$DIR/home/.cache/skyline/upgrade-summary.txt" ;;
+      f444)
+        mkdir -p "$DIR/home/.cache/skyline"
+        printf '%s\n' "$STALE_SUMMARY" >"$DIR/home/.cache/skyline/upgrade-summary.txt"
+        echo "old log" >"$DIR/home/.cache/skyline/upgrade.log"
+        chmod 444 "$DIR/home/.cache/skyline/upgrade-summary.txt" "$DIR/home/.cache/skyline/upgrade.log" ;;
+      ro)
+        RO=1; SUMF="$DIR/tmp/skyline-upgrade-summary.txt"; LOGF="$DIR/tmp/skyline-upgrade.log" ;;
+      snap) SNAP=1 ;;
       *) echo "$v" >"$STATE/$k" ;;
     esac
   done
+  [ "$SNAP" -eq 0 ] || echo "$SUMF" >"$STATE/snap_at_setup"
+  [ "$RO" -eq 0 ] || { mkdir -p "$DIR/home/.cache/skyline"; chmod 555 "$DIR/home/.cache/skyline"; }
   : >"$STATE/calls"
   : >"$OUT"
   SHP=$(command -v "$SH")
@@ -217,7 +303,80 @@ run_case() {
       # every write after the first line.
       env -i "${ENVV[@]}" "$SHP" "$SCRIPT" 2>&1 | { head -n 1 >"$OUT"; exec 0<&-; : >"$STATE/reader_gone"; }
       RC=${PIPESTATUS[0]} ;;
+    bg)
+      (
+        env -i "${ENVV[@]}" "$SHP" "$SCRIPT" >"$OUT" 2>&1 &
+        echo "$!" >"$STATE/pid"
+        wait "$!"
+        exit $?
+      ) 2>/dev/null
+      RC=$? ;;
   esac
+  [ "$RO" -eq 0 ] || chmod 755 "$DIR/home/.cache/skyline"
+}
+
+# The overlap cases' runs (review I1). start_run <role> starts one in the
+# background ($! is its pid); wait_for <file> waits (bounded, ~30 s) for a
+# marker file.
+start_run() {
+  env -i PATH="$DIR/$1/bin:$TOOLS" HOME="$DIR/home" TMPDIR="$DIR/$1/tmp" FAKE_STATE="$DIR/$1/state" \
+    "$SHP" "$SCRIPT" >"$DIR/$1/out" 2>&1 &
+}
+wait_for() {
+  wi=0
+  while [ ! -f "$1" ] && [ "$wi" -lt 600 ]; do sleep 0.05; wi=$((wi + 1)); done
+  [ -f "$1" ]
+}
+# overlap_case <shell> <case> victim-first|victim-second
+#   Two runs share one HOME, so one cache dir (/upgrade in two sessions, or a
+#   re-run while the first is still going). The victim takes the GitHub chain
+#   and its `skyline update --yes` degrades ("no upgrade applied", exit 0:
+#   #45); the other run takes the npm chain. The fakes hand over at marker
+#   files, so the order is fixed and nothing depends on timing:
+#   victim-first:  the other run starts once the victim is inside its update
+#                  and runs to its end before that update returns.
+#   victim-second: the other run starts first and waits in its setup until
+#                  the victim is inside its update; the victim's update
+#                  returns only after the other run has ended.
+#   Sets OUT/STATE/RC for the victim, OUT_OTHER/RC_OTHER, and SYNC_FAIL when
+#   a hand-over timed out.
+overlap_case() {
+  SH="$1"; CASE="$2"
+  DIR="$ROOT/$SH-$CASE"
+  SYNC="$DIR/sync"
+  mkdir -p "$SYNC" "$DIR/home"
+  for r in victim other; do
+    mkdir -p "$DIR/$r/state" "$DIR/$r/tmp"
+    write_fakes "$DIR/$r/bin"
+    echo "1.4.0" >"$DIR/$r/state/version"
+    echo "1.4.1" >"$DIR/$r/state/next"
+    : >"$DIR/$r/state/calls"
+  done
+  echo degraded >"$DIR/victim/state/mode"
+  echo npm >"$DIR/other/state/mode"
+  echo "$SYNC/victim-in-update" >"$DIR/victim/state/update_yes_signal"
+  echo "$SYNC/other-exited" >"$DIR/victim/state/update_yes_wait"
+  STATE="$DIR/victim/state"; OUT="$DIR/victim/out"; OUT_OTHER="$DIR/other/out"
+  SUMF="$DIR/home/.cache/skyline/upgrade-summary.txt"; LOGF="$DIR/home/.cache/skyline/upgrade.log"
+  SHP=$(command -v "$SH")
+  SYNC_FAIL=""
+  if [ "$3" = victim-first ]; then
+    start_run victim; pv=$!
+    wait_for "$SYNC/victim-in-update" || SYNC_FAIL="the victim never reached its update"
+    start_run other; po=$!
+  else
+    echo "$SYNC/other-in-setup" >"$DIR/other/state/setup_signal"
+    echo "$SYNC/victim-in-update" >"$DIR/other/state/setup_wait"
+    start_run other; po=$!
+    wait_for "$SYNC/other-in-setup" || SYNC_FAIL="the other run never reached its setup"
+    start_run victim; pv=$!
+  fi
+  wait "$po"; RC_OTHER=$?
+  : >"$SYNC/other-exited"
+  wait "$pv"; RC=$?
+  for r in victim other; do
+    [ ! -f "$DIR/$r/state/sync_timeout" ] || SYNC_FAIL="$SYNC_FAIL; the $r run timed out at a hand-over"
+  done
 }
 
 expected_summary() {
@@ -265,12 +424,12 @@ for SHELL_UNDER_TEST in $SHELLS; do
   calls_are "$FULL_CALLS"
   summary_ok
   # The paths come first, and the log holds the step output and the closing.
-  got=$(head -n 1 "$OUT")
-  if [ "$got" = "skyline upgrade: summary file $SUMF, full log $LOGF. If this output stops early, read the summary file." ]; then ok; else bad "first line was: [$got]"; fi
+  first_line_ok "summary file $SUMF, full log $LOGF. If this output stops early, read the summary file."
   log_has "changed 1 package"
   log_has "fake setup done"
   log_has "Upgrade complete."
-  if [ -e "$DIR/home/.cache/skyline/upgrade-step.out" ]; then bad "step file left behind"; else ok; fi
+  # No step file and no temp file is left behind.
+  cache_clean "$DIR/home/.cache/skyline"
 
   # npm-managed, npm reinstalls the same version: already current, exit 0.
   run_case "$S" npm-current mode=npm next=1.4.0
@@ -427,8 +586,8 @@ for SHELL_UNDER_TEST in $SHELLS; do
   rc_is 0
   calls_are "$FULL_CALLS"
   summary_is "$(expected_summary "updated 1.4.0 -> 1.4.1" "Upgrade complete." 0)"
-  got=$(cat "$OUT")
-  if [ "$got" = "skyline upgrade: summary file $SUMF, full log $LOGF. If this output stops early, read the summary file." ]; then ok; else bad "reader saw: [$got]"; fi
+  if [ "$(wc -l <"$OUT" | tr -d ' ')" = 1 ]; then ok; else bad "the reader saw more than the first line"; fi
+  first_line_ok "summary file $SUMF, full log $LOGF. If this output stops early, read the summary file."
   log_has "changed 1 package"
   log_has "Upgrade complete."
   run_case "$S" reader-degraded mode=degraded io=reader
@@ -446,6 +605,13 @@ for SHELL_UNDER_TEST in $SHELLS; do
   summary_has "Last step started: skyline setup (step 2 of 3)"
   summary_has "the upgrade is NOT confirmed"
   summary_has "Last step finished: binary update: npm i -g @skylence-ai/skyline@latest exited 0"
+  # Only this run's own step file is left: no temp file, nothing named like a
+  # summary.
+  left=$(ls -A "$DIR/home/.cache/skyline" | grep -vxF -e upgrade.log -e upgrade-summary.txt | tr '\n' ' ')
+  case "$left" in
+    "upgrade-step."[0-9]*".out ") ok ;;
+    *) bad "a killed run left: [$left]" ;;
+  esac
 
   # SIGTERM right after the setup step, as a systemd restart does to every
   # process of the daemon's unit (ruling 1611): the record says not finished,
@@ -458,6 +624,94 @@ for SHELL_UNDER_TEST in $SHELLS; do
   summary_has "Last step finished: skyline setup: ok"
   if grep -qF "exit code:" "$SUMF"; then bad "a stopped run wrote a final summary"; else ok; fi
   if grep -qF "Upgrade complete." "$SUMF"; then bad "stale summary survived"; else ok; fi
+
+  # Stopped before its first step (probeS of review M3: SIGTERM during the
+  # first `skyline --version`) with a previous run's "Upgrade complete." in
+  # place: the summary says this run has not finished.
+  run_case "$S" term-before-first-step mode=npm io=bg term_at_version=1 stale=1
+  if [ "$RC" -ne 0 ]; then ok; else bad "a SIGTERMed run exited 0"; fi
+  calls_are ""
+  summary_has "has not finished"
+  summary_has "Last step started: none yet"
+  if grep -qF "Upgrade complete." "$SUMF" 2>/dev/null; then bad "stale summary survived"; else ok; fi
+  header_ok
+
+  # A step killed by a signal while the reader is gone (probeT of review M3):
+  # bash and sh report it on the shell's own stderr, the dead pipe, and only
+  # the ignored SIGPIPE keeps the script alive (dash survives either way).
+  # The restart still runs and the summary is final.
+  run_case "$S" reader-step-killed mode=npm io=reader term_self_at_setup=1
+  rc_is 1
+  calls_are "$FULL_CALLS"
+  summary_has "setup:  failed (exit 143)"
+  summary_has "daemon: restarted on port 7333"
+  if [ "$(tail -n 1 "$SUMF" 2>/dev/null)" = "exit code: 1" ]; then ok; else bad "no final summary"; fi
+
+  # --- overlapping runs (review I1) --------------------------------------------
+  # Two runs in one cache dir never share a step file: the victim's degraded
+  # update is still "update failed", never "already current" (#45).
+  for order in victim-first victim-second; do
+    overlap_case "$S" "overlap-$order" "$order"
+    if [ -z "$SYNC_FAIL" ]; then ok; else bad "overlap hand-over failed: $SYNC_FAIL"; fi
+    rc_is 1
+    has "binary: update failed: update check (no upgrade applied); skyline is at 1.4.0"
+    hasnt "already current"
+    last_is "Upgrade did not complete cleanly: update failed: update check (no upgrade applied)"
+    calls_are "skyline update --check | skyline update --yes | skyline setup | skyline daemon restart --port 7333"
+    if [ "$RC_OTHER" -eq 0 ] && grep -qF "binary: updated 1.4.0 -> 1.4.1" "$OUT_OTHER"; then
+      ok
+    else
+      bad "the other run: rc $RC_OTHER, [$(grep -F 'binary:' "$OUT_OTHER")]"
+    fi
+    # The victim ends last, so the shared summary is its own.
+    summary_ok
+    cache_clean "$DIR/home/.cache/skyline"
+  done
+
+  # --- the summary is replaced, never rewritten in place (review M1) -----------
+  # A reader holding the file (a hard link the fake setup makes) keeps a whole
+  # text: the "has not finished" record as it was at setup, never a later
+  # text written into the same file.
+  run_case "$S" summary-replaced mode=npm snap=1
+  rc_is 0
+  summary_ok
+  if [ -f "$STATE/snap" ] && grep -qF "Last step started: skyline setup (step 2 of 3)" "$STATE/snap" \
+    && ! grep -qF "exit code:" "$STATE/snap"; then
+    ok
+  else
+    bad "the summary was rewritten in place: [$(tr '\n' '~' <"$STATE/snap" 2>/dev/null)]"
+  fi
+  cache_clean "$DIR/home/.cache/skyline"
+
+  # --- a previous run's files (review M2) --------------------------------------
+  # Its summary and log are mode 0444: they are removed, and this run's
+  # summary is at the documented path.
+  run_case "$S" stale-f444 mode=npm f444=1
+  rc_is 0
+  first_line_ok "summary file $SUMF, full log $LOGF. If this output stops early, read the summary file."
+  summary_ok
+  cache_clean "$DIR/home/.cache/skyline"
+  # The cache dir is read-only and holds a previous run's finished summary,
+  # which no script can fix: this run's summary goes to TMPDIR, and its first
+  # line names a start time at or after the moment the run began (upgrade.md
+  # trusts only such a summary). The run is stopped at the restart.
+  if [ "$(id -u)" -eq 0 ]; then
+    echo "upgrade.test.sh: stale-readonly not run as root (a read-only dir does not stop root)"
+  else
+    t0=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    run_case "$S" stale-readonly mode=npm stale=1 ro=1 term_at_restart=1
+    if [ "$RC" -ne 0 ]; then ok; else bad "a SIGTERMed run exited 0"; fi
+    first_line_ok "summary file $SUMF, full log $LOGF. If this output stops early, read the summary file."
+    summary_has "has not finished"
+    header_ok
+    started=$(head -n 1 "$SUMF" 2>/dev/null | sed -n 's/^skyline upgrade started \([^ ]*\) (pid.*/\1/p')
+    if [ -n "$started" ] && [ "$(printf '%s\n%s\n' "$t0" "$started" | sort | head -n 1)" = "$t0" ]; then
+      ok
+    else
+      bad "fallback summary start [$started] is before the run began [$t0]"
+    fi
+    if grep -qF "2000-01-01T00:00:00Z" "$DIR/home/.cache/skyline/upgrade-summary.txt"; then ok; else bad "the read-only dir was written"; fi
+  fi
 
   # --- where the summary goes ---------------------------------------------------
   # XDG_CACHE_HOME unset: $HOME/.cache/skyline. Set elsewhere: $XDG/skyline.
