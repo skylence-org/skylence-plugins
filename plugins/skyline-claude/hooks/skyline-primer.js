@@ -310,7 +310,8 @@ function pruneOldReports(sessionId) {
 }
 // 1.5.40 (binary-skyline#1121 group B): a plugin-only user never runs the
 // binary, and the MCP server is just a URL, so nothing tells the model when
-// no daemon is there. ONE GET /health per SessionStart, hard 300 ms deadline
+// no daemon is there. ONE GET /health per SessionStart (for `localhost`, one
+// to 127.0.0.1 and one to ::1, in parallel), hard 300 ms deadline
 // (a real timer that destroys the request, not the idle `timeout` option),
 // `agent: false` so an env proxy never sees it, no Authorization header.
 // Outcomes (orchestrator rulings on the lane, 2026-11-25):
@@ -448,7 +449,7 @@ function daemonHint(outcome, host, port) {
           " but sent no complete HTTP response within " + DAEMON_PROBE_DEADLINE_MS + " ms (SessionStart probe).";
     return (
       what +
-      " SKYLINE_DAEMON_HOST is not a loopback address, so check the skyline daemon on that host and the network path to it; skyline tools that use it may fail this session."
+      " SKYLINE_DAEMON_HOST is not 127.0.0.1, ::1 or localhost, so check the skyline daemon at that address and the network path to it; skyline tools that use it may fail this session."
     );
   }
   if (outcome === "unreachable") {

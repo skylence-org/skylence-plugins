@@ -2,8 +2,9 @@
 // Run with: node --test plugins/skyline-claude/hooks/skyline-primer-daemon.test.js
 //
 // A plugin-only user never runs the binary, so the SessionStart primer makes
-// ONE bounded GET /health and, when no daemon answers, adds one line to its
-// context. Outcome classes (orchestrator rulings on the lane, 2026-11-25):
+// ONE bounded GET /health (for `localhost`, one each to 127.0.0.1 and ::1, in
+// parallel) and, when no daemon answers, adds one line to its context.
+// Outcome classes (orchestrator rulings on the lane, 2026-11-25):
 //   (a) unreachable: refused, or no connection by the 300 ms deadline -> a
 //       hint to run `skyline setup`;
 //   (b) unanswered: a connection (even one closed before any byte) or bytes,
@@ -135,7 +136,7 @@ function track(srv) {
 
 // HTTP dummy answering every request with `status`; records url + auth, and
 // the Host header separately.
-async function httpDaemon(t, status, bind = "127.0.0.1") {
+async function httpDaemon(t, status, bind = "127.0.0.1", port = 0) {
   const requests = [];
   const hosts = [];
   const srv = http.createServer((req, res) => {
@@ -147,7 +148,7 @@ async function httpDaemon(t, status, bind = "127.0.0.1") {
   const close = track(srv);
   await new Promise((resolve, reject) => {
     srv.once("error", reject);
-    srv.listen(0, bind, resolve);
+    srv.listen(port, bind, resolve);
   });
   t.after(async () => {
     await close();
@@ -456,15 +457,40 @@ test("localhost: neither listens -> (a) setup hint naming localhost:<port>; retu
   const box = sandbox(t);
   const rec = recorder(t);
   const port = await unusedPort();
+  const refusedPort = await unusedPort();
   const optOut = await runPrimer(box, { SKYLINE_PRIMER_NO_DAEMON_CHECK: "1" });
+  const refused = await runPrimer(box, { SKYLINE_DAEMON_PORT: String(refusedPort) });
   const r = await runPrimer(box, { ...rec.env, SKYLINE_DAEMON_HOST: "localhost", SKYLINE_DAEMON_PORT: String(port) });
   const hint = assertOneHint(r, optOut, UNREACHABLE);
   assert.ok(hint.includes(`localhost:${port}`), hint);
   assert.ok(hint.includes("`skyline setup`"), hint);
-  assert.ok(r.ms < 250, `both refusals end the probe before the deadline: ${r.ms}ms`);
+  // Waiting for the 300 ms deadline would add about 300 ms to a refused run.
+  assert.ok(r.ms - refused.ms < 200, `both refusals end the probe early: ${r.ms}ms vs refused ${refused.ms}ms`);
   const { lookups, connects } = connectsAndLookups(rec);
   assert.deepEqual(lookups, []);
   assert.deepEqual(connects.sort(), [`connect 127.0.0.1 ${port}`, `connect ::1 ${port}`].sort());
+});
+
+test("localhost: 127.0.0.1 hangs while ::1 answers -> no hint: the outcome is decided over both attempts", async (t) => {
+  // Separates "both in parallel" from "127.0.0.1, then ::1 on failure": a
+  // sequential probe would sit on the hung 127.0.0.1 and report (b).
+  const box = sandbox(t);
+  const hang = await rawDaemon(t, () => {});
+  let v6;
+  try {
+    v6 = await httpDaemon(t, 200, "::1", hang.port);
+  } catch (e) {
+    t.diagnostic(`cannot bind [::1]:${hang.port} (${e.code}); hang-plus-answer leg not run`);
+    return;
+  }
+  const optOut = await runPrimer(box, { SKYLINE_PRIMER_NO_DAEMON_CHECK: "1" });
+  const r = await runPrimer(box, { SKYLINE_DAEMON_HOST: "localhost", SKYLINE_DAEMON_PORT: String(hang.port) });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout, optOut.stdout, "byte-identical: ::1 answered");
+  assert.equal(v6.requests.length, 1, "::1 was probed");
+  await settle();
+  assert.equal(hang.conns.length, 1, "127.0.0.1 was probed too");
+  assert.ok(r.ms < 1500, `absolute sanity bound: ${r.ms}ms`);
 });
 
 test("localhost: one accepts and hangs -> (b) status hint, bounded by the one deadline", async (t) => {
@@ -527,7 +553,7 @@ test("M2: a non-loopback target gets hints that name it, with no local skyline c
     [hb, hang.port],
   ]) {
     assert.ok(hint.includes(`0.0.0.0:${p}`), hint);
-    assert.ok(hint.includes("not a loopback address"), hint);
+    assert.ok(hint.includes("SKYLINE_DAEMON_HOST is not 127.0.0.1, ::1 or localhost"), hint);
     // No local command at all: every command in a hint is backticked.
     assert.ok(!hint.includes("`skyline "), hint);
     assert.ok(!/skyline setup|daemon status|daemon start/.test(hint), hint);
