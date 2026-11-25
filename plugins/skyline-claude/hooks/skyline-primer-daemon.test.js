@@ -3,15 +3,19 @@
 //
 // A plugin-only user never runs the binary, so the SessionStart primer makes
 // ONE bounded GET /health and, when no daemon answers, adds one line to its
-// context. Outcome classes (orchestrator ruling on the lane, 2026-11-25):
-//   (a) unreachable: refused, reset before any byte, DNS failure -> a hint to
-//       run `skyline setup`;
-//   (b) unanswered: a connection (or bytes) but no complete response within
-//       300 ms -> a different hint pointing at `skyline daemon status`;
+// context. Outcome classes (orchestrator rulings on the lane, 2026-11-25):
+//   (a) unreachable: refused, or no connection by the 300 ms deadline -> a
+//       hint to run `skyline setup`;
+//   (b) unanswered: a connection (even one closed before any byte) or bytes,
+//       but no complete response within 300 ms -> a different hint pointing
+//       at `skyline daemon status`;
 //   (c) any complete HTTP status -> no hint, stdout byte-identical to the
 //       probe-less (opt-out) run;
-//   (d) the probe cannot run (bad port, invalid host chars) -> no hint, same
-//       bytes as the opt-out run.
+//   (d) the probe cannot run (unusable port, a host that is neither an IP
+//       literal nor `localhost`, invalid host chars) -> no hint, same bytes
+//       as the opt-out run, and no lookup or connect at all.
+// `localhost` is probed as 127.0.0.1 and ::1 in parallel, never resolved.
+// A non-loopback target's hints carry no local skyline commands.
 // Like skyline-enforce-failopen.test.js: dummies run IN this process on
 // ephemeral ports (never 7333) and the hook is spawned ASYNC (spawnSync would
 // block the dummy). Timing assertions are relative to a refused-connection run
@@ -21,7 +25,7 @@ const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const http = require("http");
 const net = require("net");
-const { spawn } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -129,11 +133,14 @@ function track(srv) {
     });
 }
 
-// HTTP dummy answering every request with `status`; records url + auth.
+// HTTP dummy answering every request with `status`; records url + auth, and
+// the Host header separately.
 async function httpDaemon(t, status, bind = "127.0.0.1") {
   const requests = [];
+  const hosts = [];
   const srv = http.createServer((req, res) => {
     requests.push({ url: req.url, authorization: req.headers.authorization });
+    hosts.push(req.headers.host);
     res.writeHead(status, { "content-type": "application/json" });
     res.end(status === 200 ? '{"status":"ok"}' : "");
   });
@@ -146,7 +153,7 @@ async function httpDaemon(t, status, bind = "127.0.0.1") {
     await close();
     assert.equal(srv.listening, false, "dummy closed");
   });
-  return { port: srv.address().port, requests };
+  return { port: srv.address().port, requests, hosts };
 }
 
 // Raw TCP dummy: onConn(socket) decides what (if anything) is sent.
@@ -180,6 +187,53 @@ function unusedPort() {
     });
     s.on("error", reject);
   });
+}
+
+// A --require preload that records every dns.lookup call and every socket
+// connect of the spawned primer ("lookup <host>", "connect <host> <port>").
+// Appended to the inherited NODE_OPTIONS, so a suite-level preload (a connect
+// guard) stays active in the child.
+function recorder(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "primer-recorder-"));
+  t.after(() => cleanup(dir));
+  const preload = path.join(dir, "record.js");
+  const log = path.join(dir, "calls.log");
+  fs.writeFileSync(
+    preload,
+    [
+      'const fs = require("fs");',
+      'const dns = require("dns");',
+      'const net = require("net");',
+      "const LOG = process.env.PRIMER_RECORD_LOG;",
+      'const rec = (line) => { try { fs.appendFileSync(LOG, line + "\\n"); } catch (_e) {} };',
+      "const lookup = dns.lookup;",
+      'dns.lookup = function (host, ...rest) { rec("lookup " + host); return lookup.call(this, host, ...rest); };',
+      "const connect = net.Socket.prototype.connect;",
+      "net.Socket.prototype.connect = function (...args) {",
+      "  let o = args[0];",
+      "  if (Array.isArray(o)) o = o[0];",
+      '  if (o && typeof o === "object") rec("connect " + o.host + " " + o.port);',
+      '  else rec("connect " + args[1] + " " + args[0]);',
+      "  return connect.apply(this, args);",
+      "};",
+    ].join("\n") + "\n"
+  );
+  return {
+    env: {
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --require ${preload}`.trim(),
+      PRIMER_RECORD_LOG: log,
+    },
+    calls() {
+      try {
+        return fs.readFileSync(log, "utf8").split("\n").filter(Boolean);
+      } catch {
+        return [];
+      }
+    },
+    reset() {
+      cleanup(log);
+    },
+  };
 }
 
 const settle = () => new Promise((r) => setTimeout(r, 50));
@@ -231,12 +285,13 @@ test("(a) nothing listening: one-line setup hint naming host:port; returns at on
   assert.ok(!hint.includes("daemon status"), hint);
 });
 
-test("(a) accepted then closed before any byte: reset-before-any-byte is unreachable (ruling)", async (t) => {
+test("(b) accepted then closed before any byte: something is listening, so the status hint (review M1)", async (t) => {
   const box = sandbox(t);
   const d = await rawDaemon(t, (s) => s.destroy());
   const optOut = await runPrimer(box, { SKYLINE_PRIMER_NO_DAEMON_CHECK: "1" });
   const r = await runPrimer(box, { SKYLINE_DAEMON_PORT: String(d.port) });
-  assertOneHint(r, optOut, UNREACHABLE);
+  const hint = assertOneHint(r, optOut, UNANSWERED);
+  assert.ok(!hint.includes("skyline setup"), "a listener is not told to re-run setup");
   assert.equal(d.conns.length, 1, "one connection");
 });
 
@@ -309,52 +364,177 @@ test("host env: exact [::1] is unbracketed for the connect; whitespace is trimme
   assert.equal(v6.requests.length, 1);
 });
 
-test("garbage host env never throws: unresolvable names give the setup hint, bounded; control chars give today's output", async (t) => {
+test("(d) a host that is not an IP literal or localhost is never resolved or connected: today's output", async (t) => {
+  // getaddrinfo runs on the libuv threadpool and neither destroy() nor
+  // exit() can cut it short, so a hostname is not probed at all (review I1).
   const box = sandbox(t);
-  const refusedPort = await unusedPort();
+  const rec = recorder(t);
+  const port = await unusedPort();
   const optOut = await runPrimer(box, { SKYLINE_PRIMER_NO_DAEMON_CHECK: "1" });
-  const refused = await runPrimer(box, { SKYLINE_DAEMON_PORT: String(refusedPort) });
-  for (const host of ["[::1", "[127.0.0.1]", "not a host", "::1x"]) {
-    const r = await runPrimer(box, { SKYLINE_DAEMON_HOST: host, SKYLINE_DAEMON_PORT: String(refusedPort) });
-    const hint = assertOneHint(r, optOut, UNREACHABLE);
-    assert.ok(hint.length < 600, "host echo is capped");
-    assert.ok(r.ms - refused.ms < 450, `${host}: ${r.ms}ms vs refused ${refused.ms}ms`);
+  const hosts = ["daemon.example.invalid", "nonexistent-i1121.local", "not a host", "[::1", "[127.0.0.1]", "::1x", "bad\u0001host"];
+  for (const host of hosts) {
+    rec.reset();
+    const r = await runPrimer(box, { ...rec.env, SKYLINE_DAEMON_HOST: host, SKYLINE_DAEMON_PORT: String(port) });
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.stdout, optOut.stdout, `host ${JSON.stringify(host)}: today's output`);
+    assert.deepEqual(rec.calls(), [], `host ${JSON.stringify(host)}: no lookup, no connect`);
   }
-  // A control character in the host is rejected synchronously by http (d).
-  const ctl = await runPrimer(box, { SKYLINE_DAEMON_HOST: "bad\u0001host", SKYLINE_DAEMON_PORT: String(refusedPort) });
-  assert.equal(ctl.status, 0, ctl.stderr);
-  assert.equal(ctl.stdout, optOut.stdout, "control char: today's output");
+  // Positive controls: the recorder sees a probe's connect, and a dns.lookup
+  // made by a child that has the same preload.
+  rec.reset();
+  await runPrimer(box, { ...rec.env, SKYLINE_DAEMON_PORT: String(port) });
+  assert.deepEqual(rec.calls(), [`connect 127.0.0.1 ${port}`]);
+  rec.reset();
+  const ctl = spawnSync(process.execPath, ["-e", 'require("dns").lookup("localhost", () => {})'], {
+    env: { ...process.env, ...rec.env },
+  });
+  assert.equal(ctl.status, 0, String(ctl.stderr));
+  assert.deepEqual(rec.calls(), ["lookup localhost"]);
 });
 
-test("a DNS lookup that never finishes cannot hold SessionStart: setup hint, exit at the deadline", async (t) => {
-  // destroy() does not cancel an in-flight lookup, and a pending lookup keeps
-  // the event loop alive. Simulated hermetically: a --require preload swaps
-  // dns.lookup for one that answers ENOTFOUND only after a ref'd 10 s timer.
-  // The primer must still exit right after its 300 ms deadline.
+test("a real unresolvable .local host does not hold SessionStart: today's output, no slower than a refused probe", async (t) => {
+  // Real resolver, no preload. On macOS a missing `.local` name takes ~5 s
+  // in getaddrinfo; the 1.5.40 review measured SessionStart held for that long.
   const box = sandbox(t);
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "primer-slowdns-"));
-  t.after(() => cleanup(dir));
-  const preload = path.join(dir, "slow-dns.js");
-  fs.writeFileSync(
-    preload,
-    'const dns = require("dns");\n' +
-      "dns.lookup = function (host, opts, cb) {\n" +
-      '  const done = typeof opts === "function" ? opts : cb;\n' +
-      '  setTimeout(() => done(Object.assign(new Error("getaddrinfo ENOTFOUND " + host), { code: "ENOTFOUND" })), 10000);\n' +
-      "};\n"
-  );
   const refusedPort = await unusedPort();
   const optOut = await runPrimer(box, { SKYLINE_PRIMER_NO_DAEMON_CHECK: "1" });
   const refused = await runPrimer(box, { SKYLINE_DAEMON_PORT: String(refusedPort) });
-  const r = await runPrimer(box, {
-    SKYLINE_DAEMON_HOST: "slow-resolver.invalid",
-    SKYLINE_DAEMON_PORT: String(refusedPort),
-    NODE_OPTIONS: `--require ${preload}`,
-  });
+  const host = `nonexistent-i1121-${process.pid}.local`;
+  const r = await runPrimer(box, { SKYLINE_DAEMON_HOST: host, SKYLINE_DAEMON_PORT: String(refusedPort) });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout, optOut.stdout, "today's output");
+  assert.ok(r.ms - refused.ms < 450, `${host}: ${r.ms}ms vs refused ${refused.ms}ms`);
+  assert.ok(r.ms < 1500, `absolute sanity bound: ${r.ms}ms`);
+});
+
+// --- localhost: 127.0.0.1 and ::1 in parallel, never resolved (ruling 1606) ---
+
+function connectsAndLookups(rec) {
+  const calls = rec.calls();
+  return {
+    lookups: calls.filter((c) => c.startsWith("lookup ")),
+    connects: calls.filter((c) => c.startsWith("connect ")),
+  };
+}
+
+test("localhost: 127.0.0.1 answers -> no hint, byte-identical; no dns.lookup, at most 2 connects, Host localhost:<port>", async (t) => {
+  const box = sandbox(t);
+  const rec = recorder(t);
+  const d = await httpDaemon(t, 200);
+  const optOut = await runPrimer(box, { SKYLINE_PRIMER_NO_DAEMON_CHECK: "1" });
+  const r = await runPrimer(box, { ...rec.env, SKYLINE_DAEMON_HOST: "localhost", SKYLINE_DAEMON_PORT: String(d.port) });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout, optOut.stdout, "byte-identical");
+  const { lookups, connects } = connectsAndLookups(rec);
+  assert.deepEqual(lookups, [], "localhost is never resolved");
+  assert.ok(connects.length >= 1 && connects.length <= 2, connects.join(", "));
+  assert.ok(connects.every((c) => c === `connect 127.0.0.1 ${d.port}` || c === `connect ::1 ${d.port}`), connects.join(", "));
+  assert.deepEqual(d.hosts, [`localhost:${d.port}`]);
+});
+
+test("localhost: only ::1 answers -> no hint, byte-identical; no dns.lookup", async (t) => {
+  const box = sandbox(t);
+  let v6;
+  try {
+    v6 = await httpDaemon(t, 200, "::1");
+  } catch (e) {
+    t.diagnostic(`no IPv6 loopback here (${e.code}); ::1-only leg not run`);
+    return;
+  }
+  const rec = recorder(t);
+  const optOut = await runPrimer(box, { SKYLINE_PRIMER_NO_DAEMON_CHECK: "1" });
+  const r = await runPrimer(box, { ...rec.env, SKYLINE_DAEMON_HOST: "localhost", SKYLINE_DAEMON_PORT: String(v6.port) });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout, optOut.stdout, "byte-identical");
+  assert.equal(v6.requests.length, 1, "::1 was probed");
+  const { lookups, connects } = connectsAndLookups(rec);
+  assert.deepEqual(lookups, []);
+  assert.deepEqual(connects.sort(), [`connect 127.0.0.1 ${v6.port}`, `connect ::1 ${v6.port}`].sort());
+});
+
+test("localhost: neither listens -> (a) setup hint naming localhost:<port>; returns at once; no dns.lookup", async (t) => {
+  const box = sandbox(t);
+  const rec = recorder(t);
+  const port = await unusedPort();
+  const optOut = await runPrimer(box, { SKYLINE_PRIMER_NO_DAEMON_CHECK: "1" });
+  const r = await runPrimer(box, { ...rec.env, SKYLINE_DAEMON_HOST: "localhost", SKYLINE_DAEMON_PORT: String(port) });
   const hint = assertOneHint(r, optOut, UNREACHABLE);
-  assert.ok(hint.includes("slow-resolver.invalid:"), hint);
+  assert.ok(hint.includes(`localhost:${port}`), hint);
+  assert.ok(hint.includes("`skyline setup`"), hint);
+  assert.ok(r.ms < 250, `both refusals end the probe before the deadline: ${r.ms}ms`);
+  const { lookups, connects } = connectsAndLookups(rec);
+  assert.deepEqual(lookups, []);
+  assert.deepEqual(connects.sort(), [`connect 127.0.0.1 ${port}`, `connect ::1 ${port}`].sort());
+});
+
+test("localhost: one accepts and hangs -> (b) status hint, bounded by the one deadline", async (t) => {
+  const box = sandbox(t);
+  const rec = recorder(t);
+  const refusedPort = await unusedPort();
+  const d = await rawDaemon(t, () => {}); // 127.0.0.1 accepts, never writes; ::1 refuses
+  const optOut = await runPrimer(box, { SKYLINE_PRIMER_NO_DAEMON_CHECK: "1" });
+  const refused = await runPrimer(box, { SKYLINE_DAEMON_HOST: "localhost", SKYLINE_DAEMON_PORT: String(refusedPort) });
+  const r = await runPrimer(box, { ...rec.env, SKYLINE_DAEMON_HOST: "localhost", SKYLINE_DAEMON_PORT: String(d.port) });
+  const hint = assertOneHint(r, optOut, UNANSWERED);
+  assert.ok(hint.includes(`localhost:${d.port}`), hint);
+  assert.ok(hint.includes("`skyline daemon status`"), hint);
   assert.ok(r.ms >= 290, `waited for the deadline: ${r.ms}ms`);
-  assert.ok(r.ms - refused.ms < 450, `slow DNS ${r.ms}ms vs refused ${refused.ms}ms: not held by the lookup`);
+  assert.ok(r.ms - refused.ms < 450, `hang ${r.ms}ms vs refused ${refused.ms}ms: one deadline for both attempts`);
+  assert.ok(r.ms < 1500, `absolute sanity bound: ${r.ms}ms`);
+  const { lookups, connects } = connectsAndLookups(rec);
+  assert.deepEqual(lookups, []);
+  assert.ok(connects.length <= 2, connects.join(", "));
+});
+
+// --- non-loopback target (review M2) -------------------------------------------
+
+// 0.0.0.0 is not a loopback name, but a connect to it reaches this host's
+// 127.0.0.1 listeners on macOS and Linux, so the non-loopback hints can be
+// tested without binding a non-loopback address. Checked first; skipped with
+// a diagnostic where it does not hold.
+function zeroReachesLoopback(port) {
+  return new Promise((resolve) => {
+    const c = net.connect({ host: "0.0.0.0", port });
+    const done = (ok) => {
+      c.destroy();
+      resolve(ok);
+    };
+    c.once("connect", () => done(true));
+    c.once("error", () => done(false));
+    setTimeout(() => done(false), 1000).unref();
+  });
+}
+
+test("M2: a non-loopback target gets hints that name it, with no local skyline commands", async (t) => {
+  const box = sandbox(t);
+  const hang = await rawDaemon(t, () => {});
+  if (!(await zeroReachesLoopback(hang.port))) {
+    t.diagnostic("a connect to 0.0.0.0 does not reach 127.0.0.1 here; non-loopback leg not run");
+    return;
+  }
+  await settle();
+  hang.conns.length = 0;
+  const port = await unusedPort();
+  const optOut = await runPrimer(box, { SKYLINE_PRIMER_NO_DAEMON_CHECK: "1" });
+  // (a) nothing listening.
+  const a = await runPrimer(box, { SKYLINE_DAEMON_HOST: "0.0.0.0", SKYLINE_DAEMON_PORT: String(port) });
+  const ha = assertOneHint(a, optOut, UNREACHABLE);
+  // (b) accepted, no response.
+  const b = await runPrimer(box, { SKYLINE_DAEMON_HOST: "0.0.0.0", SKYLINE_DAEMON_PORT: String(hang.port) });
+  const hb = assertOneHint(b, optOut, UNANSWERED);
+  for (const [hint, p] of [
+    [ha, port],
+    [hb, hang.port],
+  ]) {
+    assert.ok(hint.includes(`0.0.0.0:${p}`), hint);
+    assert.ok(hint.includes("not a loopback address"), hint);
+    // No local command at all: every command in a hint is backticked.
+    assert.ok(!hint.includes("`skyline "), hint);
+    assert.ok(!/skyline setup|daemon status|daemon start/.test(hint), hint);
+  }
+  // Control: the same refused port on loopback keeps the local advice.
+  const lo = await runPrimer(box, { SKYLINE_DAEMON_PORT: String(port) });
+  assert.ok(assertOneHint(lo, optOut, UNREACHABLE).includes("`skyline setup`"));
 });
 
 // Differential: with a daemon answering 200 and the probe ON, stdout equals
@@ -403,14 +583,25 @@ test("differential: daemon answering, probe on -> stdout equals the 1.5.39 prime
   assert.equal(d.requests.length, inputs.length, "one GET per new-primer run, none from the old one");
 });
 
-test("(d) unusable port env: the probe cannot run, output is today's", async (t) => {
+test("(d) unusable port env: no connection is attempted at all, output is today's", async (t) => {
+  // http connects to port 80 for NaN or 0 (`options.port || 80`), so without
+  // the primer's own check these would probe :80 (review I2). The recorder
+  // proves no connect happens, whatever listens on :80 on this box.
   const box = sandbox(t);
+  const rec = recorder(t);
   const optOut = await runPrimer(box, { SKYLINE_PRIMER_NO_DAEMON_CHECK: "1" });
-  for (const port of ["not-a-port", "99999", "-1"]) {
-    const r = await runPrimer(box, { SKYLINE_DAEMON_PORT: port });
+  for (const port of ["not-a-port", "0", "00", " ", "99999", "-1", "1.5"]) {
+    rec.reset();
+    const r = await runPrimer(box, { ...rec.env, SKYLINE_DAEMON_PORT: port });
     assert.equal(r.status, 0, r.stderr);
-    assert.equal(r.stdout, optOut.stdout, `port ${port}`);
+    assert.equal(r.stdout, optOut.stdout, `port ${JSON.stringify(port)}`);
+    assert.deepEqual(rec.calls(), [], `port ${JSON.stringify(port)}: no connect`);
   }
+  // Positive control: the recorder sees the connect of a usable port.
+  const port = await unusedPort();
+  rec.reset();
+  await runPrimer(box, { ...rec.env, SKYLINE_DAEMON_PORT: String(port) });
+  assert.deepEqual(rec.calls(), [`connect 127.0.0.1 ${port}`]);
 });
 
 // --- opt-out, malformed stdin, proxy -------------------------------------------

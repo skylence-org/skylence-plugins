@@ -14,6 +14,7 @@ const fs = require("fs");
 const path = require("path");
 const { spawnSync } = require("child_process");
 const http = require("http");
+const net = require("net");
 
 function hasMarker(cwd, name) {
   if (!cwd) return false;
@@ -312,70 +313,110 @@ function pruneOldReports(sessionId) {
 // no daemon is there. ONE GET /health per SessionStart, hard 300 ms deadline
 // (a real timer that destroys the request, not the idle `timeout` option),
 // `agent: false` so an env proxy never sees it, no Authorization header.
-// Outcomes (orchestrator ruling on the lane, 2026-11-25):
+// Outcomes (orchestrator rulings on the lane, 2026-11-25):
 //   answered    - a complete status line + headers, any status: no hint,
 //                 output byte-identical to the probe-less primer.
-//   unreachable - refused, reset before any byte, DNS failure, or no
-//                 connection by the deadline: hint to run `skyline setup`.
-//   unanswered  - connected (or bytes arrived) but no complete response by
-//                 the deadline, or bytes then an error: a different hint
-//                 pointing at `skyline daemon status` (a busy daemon must not
-//                 be told to re-run setup).
-//   throw       - the probe could not run: caller prints today's output.
+//   unreachable - refused, or no connection by the deadline: hint to run
+//                 `skyline setup`.
+//   unanswered  - connected (even if then closed before any byte) or bytes
+//                 arrived, but no complete response by the deadline: a
+//                 different hint pointing at `skyline daemon status` (a busy
+//                 daemon must not be told to re-run setup).
+//   throw       - the probe cannot run: an unusable port, a host that is
+//                 neither an IP literal nor `localhost`, invalid host
+//                 characters, any exception. The caller prints today's output.
+// A non-loopback target gets either hint without local commands (M2).
 // SKYLINE_PRIMER_NO_DAEMON_CHECK=1 skips the probe (no socket is opened).
 const DAEMON_PROBE_DEADLINE_MS = 300;
 
 // Same derivation as skyline-enforce.js DAEMON_HOST / DAEMON_PORT: trimmed,
-// default 127.0.0.1:7333, exact `[::1]` unbracketed for the connect.
+// default 127.0.0.1:7333, exact `[::1]` unbracketed for the connect. Then
+// two refusals the enforce hook does not need (bounce 1):
+//   I2: http connects to port 80 for a port of NaN or 0 (`options.port ||
+//       80`), so anything but an integer in 1..65535 is not probed.
+//   I1: a hostname is resolved by getaddrinfo on the libuv threadpool, which
+//       neither req.destroy() nor process.exit() can cut short (a missing
+//       `.local` name held SessionStart for ~5 s). Only IP literals and
+//       `localhost` (probed as its loopback literals, see probeAddresses)
+//       are probed.
 function daemonTarget() {
   const host =
     ((process.env.SKYLINE_DAEMON_HOST || "").trim() || "127.0.0.1").replace(/^\[::1\]$/, "::1");
   const port = Number(process.env.SKYLINE_DAEMON_PORT || 7333);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("unusable SKYLINE_DAEMON_PORT");
+  }
+  if (net.isIP(host) === 0 && host.toLowerCase() !== "localhost") {
+    throw new Error("SKYLINE_DAEMON_HOST is not an IP literal or localhost");
+  }
   return { host, port };
+}
+
+// `localhost` is never resolved (bounce 1 I1, ruling 1606): it is probed as
+// its two loopback literals, 127.0.0.1 (where the daemon binds) and ::1, in
+// parallel under the ONE deadline (at most 2 connects), Host header still
+// `localhost:<port>`. The outcome is decided over both attempts: a complete
+// HTTP status from either is answered.
+function probeAddresses(host) {
+  return host.toLowerCase() === "localhost" ? ["127.0.0.1", "::1"] : [host];
 }
 
 function probeDaemon(host, port, done) {
   let settled = false;
-  let connected = false;
-  let sock = null;
-  let req = null;
-  const gotBytes = () => Boolean(sock && sock.bytesRead > 0);
+  const attempts = [];
+  const destroyAll = () => {
+    for (const a of attempts) {
+      try {
+        a.req.destroy();
+      } catch (_e) {
+        /* already gone */
+      }
+    }
+  };
   const finish = (outcome) => {
     if (settled) return;
     settled = true;
     clearTimeout(deadline);
-    try {
-      if (req) req.destroy();
-    } catch (_e) {
-      /* already gone */
-    }
+    destroyAll();
     done(outcome);
   };
-  const deadline = setTimeout(
-    () => finish(connected || gotBytes() ? "unanswered" : "unreachable"),
-    DAEMON_PROBE_DEADLINE_MS
-  );
+  // Something is there when an attempt connected (bounce 1 M1: even if it
+  // was then closed before any byte) or read bytes.
+  const touched = (a) => a.connected || Boolean(a.sock && a.sock.bytesRead > 0);
+  const verdict = () => (attempts.some(touched) ? "unanswered" : "unreachable");
+  const deadline = setTimeout(() => finish(verdict()), DAEMON_PROBE_DEADLINE_MS);
   try {
-    req = http.get({ host, port, path: "/health", agent: false }, (res) => {
-      try {
-        res.destroy();
-      } catch (_e) {
-        /* already gone */
-      }
-      finish("answered");
-    });
+    for (const address of probeAddresses(host)) {
+      const a = { req: null, sock: null, connected: false, failed: false };
+      const opts = { host: address, port, path: "/health", agent: false };
+      if (address !== host) opts.headers = { host: host + ":" + port };
+      a.req = http.get(opts, (res) => {
+        try {
+          res.destroy();
+        } catch (_e) {
+          /* already gone */
+        }
+        finish("answered");
+      });
+      attempts.push(a);
+      a.req.on("socket", (s) => {
+        a.sock = s;
+        s.once("connect", () => {
+          a.connected = true;
+        });
+      });
+      // Errors are emitted asynchronously, after every attempt is pushed.
+      a.req.on("error", () => {
+        a.failed = true;
+        if (attempts.every((x) => x.failed)) finish(verdict());
+      });
+    }
   } catch (e) {
     settled = true;
     clearTimeout(deadline);
+    destroyAll();
     throw e;
   }
-  req.on("socket", (s) => {
-    sock = s;
-    s.once("connect", () => {
-      connected = true;
-    });
-  });
-  req.on("error", () => finish(gotBytes() ? "unanswered" : "unreachable"));
 }
 
 // host:port as the user would type it; the host comes from the environment,
@@ -386,8 +427,30 @@ function daemonAddress(host, port) {
   return shown + ":" + port;
 }
 
+// Same loopback set as skyline-enforce.js isLoopbackHost: matched by name,
+// never resolved.
+function isLoopbackHost(host) {
+  const h = String(host).toLowerCase();
+  return h === "127.0.0.1" || h === "::1" || h === "localhost";
+}
+
 function daemonHint(outcome, host, port) {
   const addr = daemonAddress(host, port);
+  if (outcome !== "unreachable" && outcome !== "unanswered") return "";
+  // Bounce 1 M2: a daemon on another address is not fixed by running
+  // `skyline setup` or `skyline daemon ...` here, so that hint carries no
+  // local commands.
+  if (!isLoopbackHost(host)) {
+    const what =
+      outcome === "unreachable"
+        ? "The skyline daemon is not reachable on " + addr + " (SessionStart probe got no connection)."
+        : "Something accepted a connection on " + addr +
+          " but sent no complete HTTP response within " + DAEMON_PROBE_DEADLINE_MS + " ms (SessionStart probe).";
+    return (
+      what +
+      " SKYLINE_DAEMON_HOST is not a loopback address, so check the skyline daemon on that host and the network path to it; skyline tools that use it may fail this session."
+    );
+  }
   if (outcome === "unreachable") {
     return (
       "The skyline daemon is not reachable on " + addr +
@@ -396,15 +459,12 @@ function daemonHint(outcome, host, port) {
       port + "`."
     );
   }
-  if (outcome === "unanswered") {
-    return (
-      "Something accepted a connection on " + addr +
-      " but sent no complete HTTP response within " + DAEMON_PROBE_DEADLINE_MS +
-      " ms (SessionStart probe), so the skyline daemon may be busy or stuck and skyline MCP tools may fail. " +
-      "If they do, tell the user to check it with `skyline daemon status`."
-    );
-  }
-  return "";
+  return (
+    "Something accepted a connection on " + addr +
+    " but sent no complete HTTP response within " + DAEMON_PROBE_DEADLINE_MS +
+    " ms (SessionStart probe), so the skyline daemon may be busy or stuck and skyline MCP tools may fail. " +
+    "If they do, tell the user to check it with `skyline daemon status`."
+  );
 }
 
 let buf = "";
@@ -501,9 +561,10 @@ function writeContext(parts, exitAfter) {
     // Natural exit flushes async Windows pipe writes (see skyline-regate.js).
     return;
   }
-  // A started probe can leave a DNS lookup in flight that destroy() does not
-  // cancel (a hostname in SKYLINE_DAEMON_HOST). Exit once the write has
-  // flushed, so that lookup can never hold SessionStart open.
+  // Defensive: a started probe exits once the write has flushed, so nothing
+  // a destroyed request might leave pending (a half-closed socket) can hold
+  // SessionStart open. No DNS lookup is ever in flight here: daemonTarget()
+  // refuses hostnames and `localhost` is probed as its loopback literals.
   process.stdout.write(out, () => process.exit(0));
 }
 
@@ -525,8 +586,8 @@ function emitWithDaemonCheck(parts) {
       writeContext(hint ? [...parts.slice(0, 2), hint, ...parts.slice(2)] : parts, true);
     });
   } catch (_e) {
-    // (d) the probe could not run (bad port, invalid host characters, any
-    // exception): exactly today's output, no hint.
+    // (d) the probe could not run (unusable port, a host that is neither an
+    // IP literal nor `localhost`, any exception): exactly today's output.
     writeContext(parts, false);
   }
 }
