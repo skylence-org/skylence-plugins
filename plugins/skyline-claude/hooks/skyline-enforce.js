@@ -48,7 +48,7 @@ const MODE = process.argv[2] || "";
 // loopback check and the connection can never disagree about the host (a
 // padded " localhost" would otherwise pass the check yet reach the resolver
 // as-is; an empty host would make http.get connect to its implicit localhost).
-const DAEMON_HOST = (process.env.SKYLINE_DAEMON_HOST || "").trim() || "127.0.0.1";
+const DAEMON_HOST = ((process.env.SKYLINE_DAEMON_HOST || "").trim() || "127.0.0.1").replace(/^\[(.*)\]$/, "$1");
 const DAEMON_PORT = Number(process.env.SKYLINE_DAEMON_PORT || 7333);
 const DAEMON_TIMEOUT = 500;
 // Cap on the /health body the guard will parse (the real body is ~100 bytes).
@@ -722,7 +722,8 @@ function daemonBearer() {
 
 // The token belongs to the local daemon (binary-skyline binds 127.0.0.1 only
 // and keeps its token store loopback-only), so the bearer is sent only when
-// the probe target is loopback: 127.0.0.1, ::1 (with or without brackets) or
+// the probe target is loopback: 127.0.0.1, ::1 (with or without brackets; the
+// brackets are stripped once where DAEMON_HOST is defined) or
 // localhost. Matched by NAME, case-insensitive; never resolved, so a name that
 // merely points at loopback does not qualify. `host` is DAEMON_HOST, already
 // trimmed ONCE where it is defined and the very value http.get connects to, so
@@ -773,7 +774,7 @@ function isLoopbackHost(host) {
 //
 // Resolves {reachable:false} | {reachable:true, authStatus, bearerSent,
 // bearerWithheld} (both boolean)
-// | {reachable:true, maintenanceLocked:boolean}.
+// | {reachable:true, maintenanceLocked:boolean, refusal:string|null}.
 function probeDaemon() {
   return new Promise((resolve) => {
     const token = daemonBearer();
@@ -806,6 +807,18 @@ function probeDaemon() {
       finish({
         reachable: true,
         maintenanceLocked: !!health && health.maintenance_locked === true,
+        // binary-skyline >= 1.4.0 (#1069/#1081): `refusing_tools` (boolean) and
+        // `refusal` (kill_switch | subscription | free_cap | null) come from
+        // the same gate verdict call_tool enforces (src/mcp_server.rs
+        // health_body_with). Strict `=== true` only; the label is validated and
+        // never echoed unvalidated. Only a 200 /health parsed before the
+        // deadline gets here, so a 500, a hang or a late body stays enforced.
+        refusal:
+          !!health && health.refusing_tools === true
+            ? typeof health.refusal === "string" && /^[a-z_]{1,32}$/.test(health.refusal)
+              ? health.refusal
+              : "unknown"
+            : null,
       });
     };
     const deadline = setTimeout(
@@ -839,7 +852,9 @@ function probeDaemon() {
         mcpStatus = res.statusCode;
         decide();
       },
-      () => finish({ reachable: false }),
+      // An error AFTER the status line arrived does not make the daemon
+      // unreachable: it answered. Keep deciding on what is known.
+      () => (mcpStatus === null ? finish({ reachable: false }) : decide()),
       bearer ? { authorization: `Bearer ${bearer}` } : undefined
     );
 
@@ -997,6 +1012,13 @@ async function main() {
   if (probe.maintenanceLocked) {
     process.stderr.write(
       `skyline daemon reports maintenance_locked on /health (${DAEMON_HOST}:${DAEMON_PORT}); it refuses every tool call; allowing native tool\n`
+    );
+    process.exit(0);
+  }
+
+  if (probe.refusal) {
+    process.stderr.write(
+      `skyline daemon reports refusing_tools (${probe.refusal}) on /health (${DAEMON_HOST}:${DAEMON_PORT}); it refuses every tool call; allowing native tool\n`
     );
     process.exit(0);
   }

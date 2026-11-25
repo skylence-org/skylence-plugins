@@ -69,6 +69,7 @@ async function startDaemon({
   health = HEALTHY_124,
   healthStatus = 200,
   token = null, // when set, /mcp answers 401 unless it carries `Bearer <token>`
+  healthDelayMs = 0, // delay before GET /health answers (late-body tests)
   bind = "127.0.0.1", // interface the dummy listens on (0.0.0.0 / ::1 in the loopback-only bearer tests)
 } = {}) {
   const requests = [];
@@ -80,7 +81,8 @@ async function startDaemon({
     if (req.url === "/health") {
       if (health === HANG) return; // never answers
       res.writeHead(healthStatus, { "content-type": "application/json" });
-      res.end(health);
+      if (healthDelayMs > 0) setTimeout(() => res.end(health), healthDelayMs);
+      else res.end(health);
       return;
     }
     if (mcp === HANG) return; // never answers
@@ -613,7 +615,7 @@ function envProxyEngages(proxy, targetPort) {
 function stripNodeProxyWarning(stderr) {
   const lines = stderr.split("\n");
   const stripped = [];
-  while (lines.length && (/^\(node:\d+\) /.test(lines[0]) || /^\(Use `node --trace-warnings/.test(lines[0]))) {
+  while (stripped.length < 2 && lines.length && (/^\(node:\d+\) \[UNDICI-EHPA\] Warning: EnvHttpProxyAgent is experimental/.test(lines[0]) || /^\(Use `node --trace-warnings/.test(lines[0]))) {
     stripped.push(lines.shift());
   }
   return { rest: lines.join("\n"), stripped };
@@ -690,4 +692,147 @@ test("a blank SKYLINE_DAEMON_HOST falls back to the default 127.0.0.1, not to ht
     assert.equal(mcp.length, 1, "blank host: one /mcp probe");
     assert.ok(mcp[0].authorization === `Bearer ${TOKEN}`, "blank host: /mcp carried the bearer (default host is loopback)");
   });
+});
+
+// --- refusing_tools (binary-skyline >= 1.4.0, #1069/#1081) --------------------
+// Field names and values verified against binary-skyline origin/main
+// src/mcp_server.rs health_body_with (refusing_tools: bool, refusal:
+// "kill_switch" | "subscription" | "free_cap" | null).
+const health14 = (refusing, refusal) =>
+  `{"status":"ok","version":"1.4.0","account":"x","refusing_tools":${refusing},"refusal":${refusal === null ? "null" : JSON.stringify(refusal)}}`;
+
+for (const kind of ["subscription", "kill_switch", "free_cap"]) {
+  test(`refusing_tools:true (${kind}) on /health fails open on every surface, one line naming the label`, async () => {
+    await withDaemon({ mcp: 406, health: health14(true, kind) }, async (d) => {
+      for (const [label, call] of Object.entries(CALLS)) {
+        const r = await runHook(call.mode, d.port, call.input);
+        assertAllowed(`${kind} ${label}`, r, new RegExp(`refusing_tools \\(${kind}\\)`));
+      }
+    });
+  });
+}
+
+test("refusing_tools:true with a junk refusal label: one line, the label is never echoed", async () => {
+  for (const junk of ['"Sub\\u001b[31mX"', '"' + "a".repeat(80) + '"', "7", "null", "{}"]) {
+    const body = `{"status":"ok","refusing_tools":true,"refusal":${junk}}`;
+    await withDaemon({ mcp: 406, health: body }, async (d) => {
+      const r = await runHook("read", d.port, CALLS.Read.input);
+      assertAllowed(`junk ${junk.slice(0, 12)}`, r, /refusing_tools \(unknown\)/);
+    });
+  }
+});
+
+test("refusing_tools only counts as strict boolean true on a 200 /health", async () => {
+  const rows = [
+    ["refusing_tools:false (dev build, expired label)", health14(false, null).replace('"account":"x"', '"account":"expired"'), 200],
+    ["refusing_tools as the string \"true\"", '{"status":"ok","refusing_tools":"true","refusal":"subscription"}', 200],
+    ["refusing_tools as 1", '{"status":"ok","refusing_tools":1,"refusal":"subscription"}', 200],
+    ["refusal label without refusing_tools", '{"status":"ok","refusal":"subscription"}', 200],
+    ["healthy 1.4.0 body", health14(false, null), 200],
+    ["500 with a refusing body", health14(true, "subscription"), 500],
+  ];
+  for (const [name, body, status] of rows) {
+    await withDaemon({ mcp: 406, health: body, healthStatus: status }, async (d) => {
+      assertEnforced(name, await runHook("read", d.port, CALLS.Read.input));
+    });
+  }
+});
+
+test("a refusing /health body that arrives after the hard deadline stays enforced", async () => {
+  await withDaemon({ mcp: 406, health: health14(true, "subscription"), healthDelayMs: 900 }, async (d) => {
+    assertEnforced("late refusing body", await runHook("read", d.port, CALLS.Read.input));
+  });
+});
+
+// --- m2: /mcp answered, then the connection broke before /health settled -------
+test("406 on /mcp followed by a connection reset still enforces (the daemon answered)", async () => {
+  const sockets = new Set();
+  const srv = http.createServer((req, res) => {
+    if (req.url === "/health") {
+      setTimeout(() => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(HEALTHY_124);
+      }, 150);
+      return;
+    }
+    res.writeHead(406, { "content-length": "100" });
+    res.flushHeaders();
+    setTimeout(() => req.socket.resetAndDestroy(), 40); // RST, so the client sees an error after the status line
+  });
+  srv.on("connection", (s) => {
+    sockets.add(s);
+    s.on("close", () => sockets.delete(s));
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  try {
+    const r = await runHook("read", srv.address().port, CALLS.Read.input);
+    assertEnforced("406 then reset", r);
+  } finally {
+    for (const s of sockets) s.destroy();
+    await new Promise((r) => srv.close(r));
+  }
+});
+
+// --- m3: bracketed IPv6 loopback host ------------------------------------------
+test("token + host [::1] (bracketed): connects, bearer sent to /mcp only, healthy daemon stays enforced", async (t) => {
+  let d;
+  try {
+    d = await startDaemon({ mcp: 406, token: TOKEN, bind: "::1" });
+  } catch (e) {
+    return t.skip(`IPv6 loopback unavailable on this box (${e.code || e.message})`);
+  }
+  try {
+    const r = await runHook("read", d.port, CALLS.Read.input, {
+      SKYLINE_DAEMON_TOKEN: TOKEN,
+      SKYLINE_DAEMON_HOST: "[::1]",
+    });
+    assertEnforced("[::1]", r);
+    assertNoTokenLeak("[::1]", r, TOKEN);
+    const mcp = onPath(d, "/mcp");
+    assert.equal(mcp.length, 1, "[::1]: one /mcp probe");
+    assert.ok(mcp[0].authorization === `Bearer ${TOKEN}`, "[::1]: /mcp carried the bearer");
+    assert.ok(onPath(d, "/health").every((a) => a.authorization === undefined), "[::1]: /health carried no Authorization");
+  } finally {
+    await d.close();
+  }
+});
+
+// --- m1: the ONE hard deadline is load-bearing -----------------------------------
+// The http `timeout` option is idle-only: a /health that keeps trickling bytes
+// never goes idle, so only the hard DAEMON_TIMEOUT deadline bounds the hook.
+test("/health that trickles a byte every 50ms forever: enforced, bounded by the hard deadline", async () => {
+  const sockets = new Set();
+  const srv = http.createServer((req, res) => {
+    if (req.url === "/health") {
+      res.writeHead(200, { "content-type": "application/json" });
+      const t = setInterval(() => res.write(" "), 50);
+      res.on("close", () => clearInterval(t));
+      return;
+    }
+    res.writeHead(406);
+    res.end();
+  });
+  srv.on("connection", (s) => {
+    sockets.add(s);
+    s.on("close", () => sockets.delete(s));
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  try {
+    const r = await runHook("read", srv.address().port, CALLS.Read.input);
+    assert.ok(r.ms < 1500, `bounded by the hard deadline, took ${r.ms}ms (status ${r.status})`);
+    assertEnforced("trickling /health", r);
+  } finally {
+    for (const s of sockets) s.destroy();
+    await new Promise((r) => srv.close(r));
+  }
+});
+
+// --- m4: the Node-warning tolerance is exact, not any `(node:N)` line ------------
+test("stripNodeProxyWarning strips only the UNDICI-EHPA line and the trace-warnings hint, at most 2 lines", () => {
+  const ehpa = "(node:123) [UNDICI-EHPA] Warning: EnvHttpProxyAgent is experimental, expect them to change at any time.";
+  const hint = "(Use `node --trace-warnings ...` to show where the warning was created)";
+  assert.deepEqual(stripNodeProxyWarning(`${ehpa}\n${hint}\nUse read(x)`), { rest: "Use read(x)", stripped: [ehpa, hint] });
+  const other = "(node:123) [DEP0040] DeprecationWarning: The `punycode` module is deprecated.";
+  assert.deepEqual(stripNodeProxyWarning(`${other}\nUse read(x)`).stripped, [], "an unrelated Node warning is not stripped");
+  assert.deepEqual(stripNodeProxyWarning(`${ehpa}\n${ehpa}\n${ehpa}\nrest`).stripped.length, 2, "capped at 2 lines");
 });
