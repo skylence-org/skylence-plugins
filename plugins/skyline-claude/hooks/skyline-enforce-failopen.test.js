@@ -608,6 +608,17 @@ function envProxyEngages(proxy, targetPort) {
   });
 }
 
+// Leading lines matching Node's own warning shape are split off; anything else
+// (real unexpected stderr) stays in `rest` and still fails the assertions.
+function stripNodeProxyWarning(stderr) {
+  const lines = stderr.split("\n");
+  const stripped = [];
+  while (lines.length && (/^\(node:\d+\) /.test(lines[0]) || /^\(Use `node --trace-warnings/.test(lines[0]))) {
+    stripped.push(lines.shift());
+  }
+  return { rest: lines.join("\n"), stripped };
+}
+
 test("env proxy (NODE_USE_ENV_PROXY=1 + HTTP_PROXY) is bypassed: the proxy sees 0 requests, the daemon gets the bearer on /mcp, enforcement holds", async (t) => {
   // The proxy answers 403 to everything, so a probe that wrongly goes through
   // it would fail OPEN (exit 0) and the daemon would see nothing.
@@ -624,9 +635,18 @@ test("env proxy (NODE_USE_ENV_PROXY=1 + HTTP_PROXY) is bypassed: the proxy sees 
         SKYLINE_DAEMON_TOKEN: TOKEN,
       });
       assert.equal(proxy.requests.length, 0, `the proxy saw requests: ${JSON.stringify(proxy.requests)}`);
-      assertEnforced("env proxy", r);
-      assert.match(r.stderr, CALLS.Read.substitute, "env proxy: substitute text");
-      assertNoTokenLeak("env proxy", r, TOKEN);
+      // Node itself prints an experimental-warning preamble on stderr for any
+      // process run under NODE_USE_ENV_PROXY=1 (Node 22.23.2). It is not hook
+      // output: strip exactly those two lines and nothing else.
+      const { rest, stripped } = stripNodeProxyWarning(r.stderr);
+      assert.ok(
+        stripped.every((l) => /^\(node:\d+\) /.test(l) || /^\(Use `node --trace-warnings/.test(l)),
+        `env proxy: unexpected stderr lines stripped: ${JSON.stringify(stripped)}`
+      );
+      const rClean = { ...r, stderr: rest };
+      assertEnforced("env proxy", rClean);
+      assert.match(rClean.stderr, CALLS.Read.substitute, "env proxy: substitute text");
+      assertNoTokenLeak("env proxy", rClean, TOKEN);
       const mcp = onPath(d, "/mcp");
       assert.equal(mcp.length, 1, "the real daemon saw one /mcp probe");
       assert.ok(mcp[0].authorization === `Bearer ${TOKEN}`, "/mcp carried the bearer to the real daemon");
