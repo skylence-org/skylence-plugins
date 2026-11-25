@@ -31,18 +31,30 @@
  *    loop-report-path.js and stdin session_id) has a line starting
  *    `skylore:` (`skylore: nothing durable`, `skylore: marked 671`).
  * Both run BEFORE the once-marker is taken (after a read-only check that it
- * is not taken yet), so a session still blocks at most once. A block with a
- * usable report path asks for the answer as one appended `skylore:` line in
- * the named report file and nothing or one line in chat; without one (no
- * session_id, no home dir) it is the pre-1.5.37 prompt. SKYLINE_LOOP_REPORT=
- * chat: the pre-1.5.37 behavior byte for byte (no transcript or report read).
- * The marker key is unchanged (CLAUDE_SESSION_ID, else the parent pid). The
- * skyline-grok twin is NOT changed by 1.5.37 (no primer or report files there).
+ * is not taken yet), so a session still blocks at most once. A block when one
+ * of this session's report files exists asks for the answer as a `skylore:`
+ * line in the newest of them (append it, or include it in the FINAL / report
+ * you write) and nothing or one line in chat. When none exists (1.5.38, M2: a
+ * one-line Q&A must not have to create a file, and in default permission mode
+ * that file write is a prompt) or without a usable path (no session_id, no
+ * home dir) it is the pre-1.5.37 prompt: the answer goes in chat.
+ * SKYLINE_LOOP_REPORT=chat: the pre-1.5.37 behavior (no transcript or report
+ * read).
+ *
+ * 1.5.38 (audit of 1.5.37 against live Claude Code 2.1.332 sessions):
+ *  - MARKER KEY (I3): the stdin session_id, through the shared sessionFileBase
+ *    helper; process.ppid only when it is absent or unusable. Claude Code
+ *    sets no CLAUDE_SESSION_ID in the hook env, so the old key (that env var,
+ *    else ppid) was per process and re-fired on every resume. Both modes.
+ *  - FORKS (I3): the lore-tool scan reads only this session's own entries
+ *    (transcript-scope.js ownStart), not a fork parent's inherited calls.
+ * The skyline-grok twin is NOT changed (no primer or report files there).
  */
 
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { sessionFileBase } = require("./loop-report-path");
 
 const DEPOSIT_PROMPT =
   "Stop check: anything this session that would cost the next one real time to re-derive? \"Nothing durable\" is a correct answer — say it and stop. If there IS something, invoke skylore-deposit-skill and follow it: it covers recall-before-mark, supersede-instead-of-duplicate, scoping, and what does not belong in the bank.";
@@ -50,26 +62,28 @@ const DEPOSIT_PROMPT =
 const LORE_TOOL = /lore_(?:mark|supersede)$/;
 const SKYLORE_LINE = /^skylore:/m;
 
-function filePrompt(target, exists) {
-  const create = exists
-    ? ""
-    : " (it does not exist yet: create it with the lines `# skylore REPORT` and `loop-report: v1` first)";
+// M3 (1.5.38): the same wording as the loop gate's Stop message, which writes
+// the FINAL with create (overwrite:true): append the line, or include it in
+// the FINAL / report being written. Never "never overwrite".
+function filePrompt(target, kind) {
+  const doc = kind === "final" ? "FINAL" : "report";
   return (
     "Stop check: anything this session that would cost the next one real time to re-derive? \"Nothing durable\" is a correct answer. " +
-    `Answer in the session report, not in chat: append one line \`skylore: nothing durable\` to \`${target}\`${create}; never overwrite that file. ` +
-    "If there IS something, invoke skylore-deposit-skill and follow it, then append `skylore: marked <ids>` instead (a lore_mark or lore_supersede call also counts as the answer). " +
+    `Answer in the session report, not in chat: append the \`skylore:\` line (\`skylore: nothing durable\`) to \`${target}\`, or include it in the ${doc} you write. ` +
+    "If there IS something, invoke skylore-deposit-skill and follow it, then write `skylore: marked <ids>` instead (a lore_mark or lore_supersede call also counts as the answer). " +
     "Chat gets nothing, or one line."
   );
 }
 
-function getSessionKey() {
-  const id = process.env.CLAUDE_SESSION_ID;
-  return id ? String(id) : String(process.ppid);
+let sessionKey = String(process.ppid);
+
+function setSessionKey(input) {
+  const sid = input && typeof input.session_id === "string" ? sessionFileBase(input.session_id) : null;
+  sessionKey = sid || String(process.ppid);
 }
 
 function getDepositMarkerPath() {
-  const key = getSessionKey().replace(/[^a-z0-9_-]/gi, "_");
-  return path.join(os.tmpdir(), `skyline-skylore-deposit-${key}.marker`);
+  return path.join(os.tmpdir(), `skyline-skylore-deposit-${sessionKey}.marker`);
 }
 
 /** true on first fire this session (O_EXCL), false on repeats / fs error. */
@@ -99,7 +113,11 @@ function transcriptHasLoreCall(transcriptPath) {
   } catch (_e) {
     return false;
   }
-  for (const line of text.split("\n")) {
+  const lines = text.split("\n");
+  // A fork's inherited parent entries are not this session's answer.
+  const { ownStart } = require("./transcript-scope");
+  for (let i = ownStart(lines, transcriptPath); i < lines.length; i += 1) {
+    const line = lines[i];
     if (!line.includes("lore_")) continue; // cheap prefilter, then parse
     let entry;
     try {
@@ -134,13 +152,15 @@ function silentAnswer(input) {
     const paths = reportPaths(input.session_id);
     if (!paths) return { answered: false, reason: null };
     let newest = null;
-    for (const p of [paths.final, paths.debug, paths.review]) {
+    for (const kind of ["final", "debug", "review"]) {
+      const p = paths[kind];
       const text = readReportText(p);
       if (text && SKYLORE_LINE.test(text)) return { answered: true };
       const m = mtimeOf(p);
-      if (m !== null && (!newest || m > newest.m)) newest = { p, m };
+      if (m !== null && (!newest || m > newest.m)) newest = { p, m, kind };
     }
-    return { answered: false, reason: newest ? filePrompt(newest.p, true) : filePrompt(paths.final, false) };
+    // M2: no report file this session => the pre-1.5.37 chat prompt.
+    return { answered: false, reason: newest ? filePrompt(newest.p, newest.kind) : null };
   } catch (_e) {
     return { answered: false, reason: null };
   }
@@ -158,6 +178,7 @@ process.stdin.on("end", () => {
   } catch (_e) {
     process.exit(0); // malformed => silent exit 0
   }
+  setSessionKey(input);
 
   let reason = DEPOSIT_PROMPT;
   if (process.env.SKYLINE_LOOP_REPORT !== "chat") {

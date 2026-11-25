@@ -506,6 +506,24 @@ function counterFile(sid) {
   return path.join(os.tmpdir(), `skyline-loop-gate-${sid}`);
 }
 
+// 1.5.38: a session's gate state is its session-wide counter, its per-turn
+// counters (`@<prompt_id>`) and its merit-pass line (`+pass`). Exact names
+// only, so files of other runs and other sessions are never touched.
+function removeGateState(sid) {
+  const base = `skyline-loop-gate-${sid}`;
+  let names = [];
+  try {
+    names = fs.readdirSync(os.tmpdir());
+  } catch (_e) {
+    return;
+  }
+  for (const n of names) {
+    if (n === base || n === `${base}+pass` || n.startsWith(`${base}@`)) {
+      fs.rmSync(path.join(os.tmpdir(), n), { force: true });
+    }
+  }
+}
+
 // Expected file stem for a raw session id, written from the rule rather than
 // imported from the hook: chars outside [A-Za-z0-9._-] become "_", cut to
 // 128, and "-" + the first 8 hex chars of sha256(raw) when that changed it.
@@ -574,8 +592,8 @@ function reportFixture(t, tag, entries) {
     addLive(reportPath, lines) {
       fs.appendFileSync(transcript, liveWrites(reportPath, lines).join("\n") + "\n");
     },
-    stop(env, sessionId, cwd) {
-      return runHook("stop", payload(sessionId), { SKYLINE_LOOP_REPORT_DIR: dir, ...(env || {}) }, cwd);
+    stop(env, sessionId, cwd, extra) {
+      return runHook("stop", payload(sessionId, extra), { SKYLINE_LOOP_REPORT_DIR: dir, ...(env || {}) }, cwd);
     },
     commit(env, sessionId) {
       return runHook(
@@ -590,7 +608,7 @@ function reportFixture(t, tag, entries) {
   };
   t.after(() => {
     fs.rmSync(tmp, { recursive: true, force: true });
-    for (const c of counters) fs.rmSync(counterFile(c), { force: true });
+    for (const c of counters) removeGateState(c);
   });
   return fx;
 }
@@ -652,13 +670,16 @@ test("report file (3): report missing two fields: blocks and names exactly those
   );
   let r = fx.stop();
   assert.equal(r.code, 2);
-  assert.ok(r.err.includes(`The report file \`${fx.report}\` is missing fields: slices, tests.`), r.err);
+  assert.ok(r.err.includes(`The report file \`${fx.report}\` is missing fields: \`slices shipped\` (slices), \`test counts\` (tests).`), r.err);
 
   // Order comes from the field table, not from the report's own order.
   fs.writeFileSync(fx.report, "deviations: None\nslices shipped: 2 slices, a1b2c3d\n");
   r = fx.stop();
   assert.equal(r.code, 2);
-  assert.ok(r.err.includes("is missing fields: checkpoint, tests."), r.err);
+  assert.ok(
+    r.err.includes("is missing fields: `CHECKPOINT: <name> = done|skipped(<reason>)|n/a|not-emitted` (checkpoint), `test counts` (tests)."),
+    r.err
+  );
 });
 
 test("report file (4): report path is a symlink to a valid report: rejected, blocks and says why", (t) => {
@@ -1242,7 +1263,12 @@ test("not-emitted (h): coupling note is not appended beside a report file that l
   fs.writeFileSync(fx.report, "# feature-loop FINAL\nloop-report: v1\nnotes only\n");
   const r = fx.stop();
   assert.equal(r.code, 2);
-  assert.ok(r.err.includes("is missing fields: checkpoint, deviations, slices, tests"), r.err);
+  assert.ok(
+    r.err.includes(
+      "is missing fields: `CHECKPOINT: <name> = done|skipped(<reason>)|n/a|not-emitted` (checkpoint), `deviations` (deviations), `slices shipped` (slices), `test counts` (tests)."
+    ),
+    r.err
+  );
   assert.ok(!r.err.includes("The only failing check"), r.err);
 });
 
@@ -1552,7 +1578,7 @@ test("C2 (11): live CHECKPOINT edits that carry the realpath anchor of a symlink
   let r = fx.stop({ SKYLINE_LOOP_REPORT_DIR: link });
   assert.equal(r.code, 0, r.err);
   // FINAL appended by an edit that also carries the realpath anchor.
-  fs.rmSync(counterFile(fx.sid), { force: true });
+  removeGateState(fx.sid); // each scenario below is a new history for this sid
   write([
     ...liveWrites(real),
     toolUse("mcp__skyline__edit", { patch: `¶${real}#CD34\ninsert tail:\n+${VALID_REPORT}` }),
@@ -1560,9 +1586,581 @@ test("C2 (11): live CHECKPOINT edits that carry the realpath anchor of a symlink
   r = fx.stop({ SKYLINE_LOOP_REPORT_DIR: link });
   assert.equal(r.code, 0, r.err);
   // Reconstruction is still caught under the realpath form.
-  fs.rmSync(counterFile(fx.sid), { force: true });
+  removeGateState(fx.sid);
   write([toolUse("mcp__skyline__edit", { patch: `¶${real}#EF56\ninsert tail:\n+${VALID_REPORT}` }), ...liveWrites(real)]);
   r = fx.stop({ SKYLINE_LOOP_REPORT_DIR: link });
   assert.equal(r.code, 2);
   assert.match(r.err, /no live write before the FINAL write/);
+});
+
+// --- 1.5.38: audit of 1.5.37 with live Claude Code sessions (I1-I4, M1, M5, M8)
+
+function passFileOf(sid) {
+  return `${counterFile(sid)}+pass`;
+}
+
+// Claude Code appends to the transcript; these tests do too.
+function appendEntries(fx, entries) {
+  fs.appendFileSync(fx.transcript, entries.join("\n") + "\n");
+}
+
+function turnStop(fx, promptId, extra) {
+  return fx.stop(undefined, undefined, undefined, { ...(promptId === undefined ? {} : { prompt_id: promptId }), ...(extra || {}) });
+}
+
+const INTERIM_REPORT = reportBody(
+  [
+    "CHECKPOINT: post-model = skipped(no advisor tool)",
+    "slices shipped: 1 of 3 (a1b2c3d), paused for a user question",
+    "test counts: 4 passed, 0 failed",
+    "deviations from this skill: interim FINAL, build paused after slice 1",
+  ].join("\n")
+);
+
+const DONE_REPORT = reportBody(
+  [
+    "CHECKPOINT: post-model = skipped(no advisor tool)",
+    "CHECKPOINT: post-first-surface = done",
+    "CHECKPOINT: pre-final = done",
+    "slices shipped: 3 (a1b2c3d e4f5a6b 0c1d2e3)",
+    "test counts: 26 passed, 0 failed",
+    "deviations from this skill: None",
+  ].join("\n")
+);
+
+// Turn 1 of a build that pauses after slice 1: blocked once, then an interim
+// FINAL passes on merit (the I1 field shape, audit live run b2).
+function pausedTurnOne(t, tag) {
+  const fx = reportFixture(t, tag, [assistantSkillInvoke("feature-loop-skill")]);
+  appendEntries(fx, [...liveWrites(fx.report, ["CHECKPOINT: post-model = skipped(no advisor tool)"]), assistantGitCommit()]);
+  const blocked = turnStop(fx, "turn-1");
+  fs.writeFileSync(fx.report, INTERIM_REPORT);
+  appendEntries(fx, [finalCreate(fx.report, INTERIM_REPORT)]);
+  const passed = turnStop(fx, "turn-1");
+  return { fx, blocked, passed };
+}
+
+test("I1 (1): multi-turn build: interim FINAL passes on merit; turn 2 live checkpoints + FINAL rewrite pass on merit (no checkpoint-not-live)", (t) => {
+  const { fx, blocked, passed } = pausedTurnOne(t, "i1-1");
+  assert.equal(blocked.code, 2);
+  assert.ok(
+    blocked.err.includes(
+      "Pausing mid-build => write an interim FINAL (slices so far); keep appending CHECKPOINT lines and rewrite the FINAL when done."
+    ),
+    blocked.err
+  );
+  assert.equal(passed.code, 0, passed.err);
+  assert.ok(fs.existsSync(passFileOf(fx.sid)), "a merit pass stores the transcript position");
+  // Turn 2: the build resumes, each checkpoint is appended live, the FINAL is rewritten.
+  appendEntries(fx, [
+    assistantText("resuming the build"),
+    ...liveWrites(fx.report, ["CHECKPOINT: post-first-surface = done"]),
+    assistantGitCommit(),
+    ...liveWrites(fx.report, ["CHECKPOINT: pre-final = done"]),
+  ]);
+  fs.writeFileSync(fx.report, DONE_REPORT);
+  appendEntries(fx, [finalCreate(fx.report, DONE_REPORT)]);
+  const r = turnStop(fx, "turn-2");
+  assert.equal(r.code, 0, r.err);
+  assert.equal(r.err, "");
+});
+
+test("I1 (2): after a merit pass, C2 (2b) still holds within the new attempt: FINAL rewrite, then the append, is not live", (t) => {
+  const { fx, passed } = pausedTurnOne(t, "i1-2");
+  assert.equal(passed.code, 0, passed.err);
+  appendEntries(fx, [...liveWrites(fx.report, ["CHECKPOINT: post-first-surface = done"]), assistantGitCommit()]);
+  fs.writeFileSync(fx.report, DONE_REPORT);
+  appendEntries(fx, [finalCreate(fx.report, DONE_REPORT), ...liveWrites(fx.report, ["CHECKPOINT: pre-final = done"])]);
+  const r = turnStop(fx, "turn-2");
+  assert.equal(r.code, 2);
+  assert.ok(r.err.includes("is missing fields: checkpoint-not-live."), r.err);
+  assert.ok(r.err.includes("no live write before the FINAL write: `CHECKPOINT: pre-final = done`."), r.err);
+});
+
+test("I1 (3): a line that only a FINAL before the last pass carried is not live in the next attempt", (t) => {
+  const fx = reportFixture(t, "i1-3", [assistantSkillInvoke("feature-loop-skill"), assistantGitCommit()]);
+  // Attempt 1: a reconstructed post-model line, blocked; rewritten honestly, passes.
+  const reconstructed = reportBody("CHECKPOINT: post-model = done\nslices shipped: 1 (a1b2c3d)\ntest counts: 4 passed\ndeviations from this skill: None");
+  fs.writeFileSync(fx.report, reconstructed);
+  appendEntries(fx, [finalCreate(fx.report, reconstructed)]);
+  assert.equal(turnStop(fx, "turn-1").code, 2);
+  const honest = reportBody(
+    "CHECKPOINT: post-model = not-emitted\nslices shipped: 1 (a1b2c3d)\ntest counts: 4 passed\ndeviations from this skill: post-model checkpoint not emitted live"
+  );
+  fs.writeFileSync(fx.report, honest);
+  appendEntries(fx, [finalCreate(fx.report, honest)]);
+  const pass = turnStop(fx, "turn-1");
+  assert.equal(pass.code, 0, pass.err);
+  // Attempt 2: the reconstructed line comes back, copied from the first FINAL.
+  fs.writeFileSync(fx.report, reconstructed);
+  appendEntries(fx, [assistantGitCommit(), finalCreate(fx.report, reconstructed)]);
+  const r = turnStop(fx, "turn-2");
+  assert.equal(r.code, 2);
+  assert.ok(r.err.includes("no live write before the FINAL write: `CHECKPOINT: post-model = done`."), r.err);
+});
+
+test("I1 (4): a stored pass line past the transcript's end is ignored (C2 (2b) is checked as before)", (t) => {
+  const fx = orderedFixture(t, "i1-4", (r) => [finalCreate(r), ...liveWrites(r)]);
+  fs.writeFileSync(passFileOf(fx.sid), "999999");
+  const r = fx.stop();
+  assert.equal(r.code, 2);
+  assert.match(r.err, /is missing fields: checkpoint-not-live\./);
+});
+
+test("I2 (1): two blocks in turn 1 do not exhaust turn 2; the block text never advertises the fail-open", (t) => {
+  const fx = reportFixture(t, "i2-1");
+  const t1 = [turnStop(fx, "turn-1"), turnStop(fx, "turn-1"), turnStop(fx, "turn-1")];
+  assert.deepEqual(
+    t1.map((r) => r.code),
+    [2, 2, 0],
+    "per turn: two blocks, then the fail-open"
+  );
+  const t2 = turnStop(fx, "turn-2");
+  assert.equal(t2.code, 2, "turn 2 has its own budget");
+  for (const r of [...t1.slice(0, 2), t2]) assert.doesNotMatch(r.err, /fail-open|fails open|advisory|MAX_BLOCKS|third Stop/i);
+});
+
+test("I2 (2): a merit pass resets the budget; a fail-open does not", (t) => {
+  const fx = reportFixture(t, "i2-2");
+  assert.equal(fx.stop().code, 2);
+  assert.equal(fx.stop().code, 2);
+  fs.writeFileSync(fx.report, VALID_REPORT);
+  assert.equal(fx.stop().code, 0, "merit pass");
+  assert.equal(fs.existsSync(counterFile(fx.sid)), false, "the merit pass deleted the counter");
+  fs.writeFileSync(fx.report, "# feature-loop FINAL\nloop-report: v1\nnotes only\n");
+  const again = [fx.stop(), fx.stop(), fx.stop()].map((r) => r.code);
+  assert.deepEqual(again, [2, 2, 0], "a fresh budget after the pass (1.5.37: 0 at once)");
+  assert.equal(fs.readFileSync(counterFile(fx.sid), "utf8"), "3", "the fail-open left the counter in place");
+});
+
+test("I2 (3): without a usable prompt_id the counter is the session-wide pre-1.5.38 file; with one it is per turn", (t) => {
+  const fx = reportFixture(t, "i2-3");
+  assert.equal(fx.stop().code, 2);
+  assert.equal(fs.readFileSync(counterFile(fx.sid), "utf8"), "1");
+  assert.equal(turnStop(fx, 42).code, 2, "a non-string prompt_id falls back to the session key");
+  assert.equal(fs.readFileSync(counterFile(fx.sid), "utf8"), "2");
+  assert.equal(turnStop(fx, "p/1").code, 2);
+  assert.equal(fs.readFileSync(`${counterFile(fx.sid)}@${sidName("p/1")}`, "utf8"), "1", "sanitized like a session id");
+});
+
+// A fork transcript in the live shape (Claude Code 2.1.332, audit fork run):
+// header lines with the derived-from marker, the parent's entries copied with
+// their uuids, then the fork's own entries.
+function withUuid(entryLine, uuid, sessionId) {
+  return JSON.stringify({ ...JSON.parse(entryLine), uuid, sessionId });
+}
+
+function forkFixture(t, tag, { parent = true, parentId, ownEntries } = {}) {
+  const fx = reportFixture(t, tag, []);
+  const pid = parentId || `${fx.sid}-parent`;
+  const parentReport = path.join(fx.dir, `${pid}.md`);
+  const parentEntries = [
+    ...assistantSkillInvoke("feature-loop-skill").split("\n"),
+    assistantGitCommit(),
+    ...liveWrites(parentReport),
+    finalCreate(parentReport),
+    assistantText(`FINAL stored: ${parentReport}`),
+  ];
+  const parentLines = parentEntries.map((l, i) => withUuid(l, `${pid}-u${i}`, pid));
+  if (parent) fs.writeFileSync(path.join(fx.tmp, `${pid}.jsonl`), parentLines.join("\n") + "\n");
+  const header = [
+    line({ type: "mode", mode: "normal", sessionId: fx.sid }),
+    line({ type: "derived-from", v: 1, sessionId: fx.sid, sessions: [{ type: "claude_code_session", id: pid, via: "fork" }] }),
+    line({ type: "queue-operation", operation: "enqueue", sessionId: fx.sid, content: "Reply with exactly: ok" }),
+  ];
+  const inherited = parentEntries.map((l, i) => withUuid(l, `${pid}-u${i}`, fx.sid));
+  const own = (ownEntries || [line({ type: "user", message: { content: "Reply with exactly: ok" } }), assistantText("ok")]).map((l, i) =>
+    withUuid(l, `${fx.sid}-own${i}`, fx.sid)
+  );
+  fs.writeFileSync(fx.transcript, [...header, ...inherited, ...own].join("\n") + "\n");
+  return fx;
+}
+
+test("I3 (1): fork of a finished build, trivial own turn: Stop and the commit reminder stay silent; no FINAL is owed", (t) => {
+  const fx = forkFixture(t, "i3-1");
+  const r = fx.stop();
+  assert.equal(r.code, 0, r.err);
+  assert.equal(r.err, "");
+  assert.equal(fs.existsSync(fx.report), false);
+  assert.equal(fx.commit().out, "", "the inherited Skill call does not arm the commit reminder");
+});
+
+test("I3 (2): fork whose parent transcript is missing: no scoping, the gate blocks as before", (t) => {
+  const fx = forkFixture(t, "i3-2", { parent: false });
+  const r = fx.stop();
+  assert.equal(r.code, 2);
+  assert.ok(r.err.includes(fx.report), r.err);
+});
+
+test("I3 (3): a fork that really invokes the skill and commits is gated on its own activity", (t) => {
+  const fx = forkFixture(t, "i3-3", {
+    ownEntries: [...assistantSkillInvoke("feature-loop-skill").split("\n"), assistantGitCommit(), assistantText("slice 1 done")],
+  });
+  const r = fx.stop();
+  assert.equal(r.code, 2);
+  assert.ok(r.err.includes(fx.report), "names the FORK's report path");
+  fs.appendFileSync(fx.transcript, [...liveWrites(fx.report), finalCreate(fx.report)].join("\n") + "\n");
+  fs.writeFileSync(fx.report, VALID_REPORT);
+  const ok = fx.stop();
+  assert.equal(ok.code, 0, ok.err);
+});
+
+test("I3 (4): a parent id outside [A-Za-z0-9._-] is never resolved, even when that path holds the parent's entries", (t) => {
+  const fx = forkFixture(t, "i3-4", { parent: false, parentId: "sub/decoy" });
+  fs.mkdirSync(path.join(fx.tmp, "sub"));
+  const decoy = fs
+    .readFileSync(fx.transcript, "utf8")
+    .split("\n")
+    .filter((l) => l.includes("sub/decoy-u"));
+  fs.writeFileSync(path.join(fx.tmp, "sub", "decoy.jsonl"), decoy.join("\n") + "\n");
+  assert.equal(fx.stop().code, 2);
+});
+
+test("M1 (1): live writes naming the report as ~/..., with backslashes, //, /./ or seg/.. count as live", (t) => {
+  const spellings = [
+    ["tilde", (r, home) => "~" + r.slice(home.length)],
+    ["backslash", (r) => r.replace(/\//g, "\\")],
+    ["double-slash", (r) => r.replace("/reports/", "//reports/")],
+    ["dot-segment", (r) => r.replace("/reports/", "/reports/./")],
+    ["dotdot", (r) => r.replace("/reports/", "/reports/x/../")],
+  ];
+  for (const [label, spell] of spellings) {
+    const fx = reportFixture(t, `m1-${label}`);
+    const s = spell(fx.report, fx.tmp);
+    assert.notEqual(s, fx.report);
+    fs.writeFileSync(
+      fx.transcript,
+      [assistantSkillInvoke("feature-loop-skill"), assistantGitCommit(), ...liveWrites(s), finalCreate(s)].join("\n") + "\n"
+    );
+    fs.writeFileSync(fx.report, VALID_REPORT);
+    const r = fx.stop({ HOME: fx.tmp });
+    assert.equal(r.code, 0, `${label}: ${r.err}`);
+  }
+});
+
+test("M1 (2): normalizing never makes another file the report: ~ mid-token, <report>.bak, another home", (t) => {
+  const spellings = [
+    ["mid-token tilde", (r, home) => "x~" + r.slice(home.length)],
+    ["bak", (r, home) => "~" + r.slice(home.length) + ".bak"],
+    ["other home", (r, home) => "~/elsewhere" + r.slice(home.length)],
+  ];
+  for (const [label, spell] of spellings) {
+    const fx = reportFixture(t, `m1n-${label.replace(/ /g, "-")}`);
+    const s = spell(fx.report, fx.tmp);
+    fs.writeFileSync(
+      fx.transcript,
+      [assistantSkillInvoke("feature-loop-skill"), assistantGitCommit(), ...liveWrites(s), finalCreate(fx.report)].join("\n") + "\n"
+    );
+    fs.writeFileSync(fx.report, VALID_REPORT);
+    const r = fx.stop({ HOME: fx.tmp });
+    assert.equal(r.code, 2, label);
+    assert.match(r.err, /no live write before the FINAL write/, label);
+  }
+});
+
+// COMMIT MATCHER CONTRACT (bounce 2 class ruling): isCommitCall is specified
+// by this ONE table, folded from the review matrices (m5.js 29 rows,
+// u1attack.js 49 rows, fence.js, the M5 (1) rows) plus the bounce-2 rows.
+// Every new shape is added HERE, with the value the matcher returns today:
+//   ok          = the value is the right answer;
+//   known miss  = a real commit the matcher does not see (documented, not fixed);
+//   known FP    = prose or a non-commit the matcher reads as a commit.
+// Changing a row's value is a contract change: say so in the PR.
+const RUN_TOOL = "mcp__plugin_skyline-claude_skyline__run";
+const BASH = (command) => ["Bash", { command }];
+const WRITE = (content) => ["Write", { file_path: "/x/a.md", content }];
+const FENCE_1MB = "```\n" + "x y z commit w\n".repeat(Math.ceil((1024 * 1024) / 15)) + "```\n";
+const COMMIT_MATCHER_TABLE = [
+  // [label, [tool, input], matches, status]
+  // --- real commits, matched
+  ["git commit -m x", BASH("git commit -m x"), true, "ok"],
+  ["git commit -m wip", BASH("git commit -m wip"), true, "ok"],
+  ["git -C /r commit", BASH("git -C /r commit -m x"), true, "ok"],
+  ["git -c user.name=a commit", BASH("git -c user.name=a commit -m x"), true, "ok"],
+  ['git -c "user.name=A B" commit', BASH('git -c "user.name=A B" commit -m "x"'), true, "ok"],
+  ['git -c core.editor="vim; x" commit', BASH('git -c core.editor="vim; x" commit -m m'), true, "ok"],
+  ['git -C "a (b)" commit', BASH('git -C "a (b)" commit -m m'), true, "ok"],
+  ['git -C "$(git rev-parse --show-toplevel)" commit', BASH('git -C "$(git rev-parse --show-toplevel)" commit -m m'), true, "ok"],
+  ["git -C `pwd` commit (backtick value, bounce 2 finding 3)", BASH("git -C `pwd` commit -m m"), true, "ok"],
+  ["git -C $REPO commit", BASH("git -C $REPO commit -m m"), true, "ok"],
+  ["git -C ${REPO} commit", BASH("git -C ${REPO} commit -m m"), true, "ok"],
+  ["/usr/bin/git --no-pager commit", BASH("/usr/bin/git --no-pager commit -m x"), true, "ok"],
+  ["git.exe (Windows path) commit", BASH("C:\\Program Files\\Git\\bin\\git.exe commit -m x"), true, "ok"],
+  ["GIT_EDITOR=true git commit --amend", BASH("GIT_EDITOR=true git commit --amend --no-edit"), true, "ok"],
+  ["FOO=1 git commit", BASH("FOO=1 git commit -m m"), true, "ok"],
+  ["env X=1 git commit", BASH("env X=1 git commit -m x"), true, "ok"],
+  ["command git commit", BASH("command git commit -m x"), true, "ok"],
+  ["nice -n 5 git commit", BASH("nice -n 5 git commit -m x"), true, "ok"],
+  ["sudo -u a git commit", BASH("sudo -u a git commit -m x"), true, "ok"],
+  ["xargs git commit", BASH("echo x | xargs git commit -m"), true, "ok"],
+  ["(cd r; git commit -m x)", BASH("(cd r; git commit -m x)"), true, "ok"],
+  ["cd r && git commit", BASH("cd r && git commit -m x"), true, "ok"],
+  ["git add -A && git commit", BASH("git add -A && git commit -m x"), true, "ok"],
+  ["git add . ; git commit -am x", BASH("git add . ; git commit -am x"), true, "ok"],
+  ["git commit 2>&1 | tail", BASH("git commit -m x 2>&1 | tail -3"), true, "ok"],
+  ["git commit>log", BASH("git commit -m x>log"), true, "ok"],
+  ['git commit -m "$(date)"', BASH('git commit -m "$(date)"'), true, "ok"],
+  ["cd /r && git commit -m \"$(cat <<'EOF' ...)\"", BASH("cd /r && git commit -m \"$(cat <<'EOF'\nfix: x\n\nCo-Authored-By: C <n@a.com>\nEOF\n)\""), true, "ok"],
+  ["git commit -F - <<'EOF' heredoc", BASH("git commit -F - <<'EOF'\nmsg\nEOF"), true, "ok"],
+  ["sh -c 'git commit -m x' (bounce 1 Minor 1)", BASH("sh -c 'git commit -m x'"), true, "ok"],
+  ['bash -lc "cd /r && git commit -m x"', BASH('bash -lc "cd /r && git commit -m x"'), true, "ok"],
+  ["ssh host 'cd r && git commit -m x'", BASH("ssh host 'cd r && git commit -m x'"), true, "ok"],
+  ['timeout 60 sh -c "git -C /r commit -m x"', BASH('timeout 60 sh -c "git -C /r commit -m x"'), true, "ok"],
+  ['bash -c "git -c a=\'b; c\' commit"', BASH("bash -c \"git -c a='b; c' commit -m x\""), true, "ok"],
+  ["docker exec c sh -c 'cd r && git commit'", BASH("docker exec c sh -c 'cd r && git commit -m x'"), true, "ok"],
+  ["eval 'git commit -m x'", BASH("eval 'git commit -m x'"), true, "ok"],
+  ["sh -c $'git commit -m x' (ANSI-C quote, bounce 2 finding 4)", BASH("sh -c $'git commit -m x'"), true, "ok"],
+  ["argv [git,-c,user.email=a@b,-c,user.name=x,commit]", [RUN_TOOL, { argv: ["git", "-c", "user.email=a@b", "-c", "user.name=x", "commit", "-m", "slice"] }], true, "ok"],
+  ["argv [git,-C,/r,commit]", [RUN_TOOL, { argv: ["git", "-C", "/r", "commit", "-m", "x"] }], true, "ok"],
+  ["argv [git,--no-pager,-c,k=v,commit]", [RUN_TOOL, { argv: ["git", "--no-pager", "-c", "k=v", "commit", "-m", "x"] }], true, "ok"],
+  ["argv [/usr/bin/git,--no-pager,--git-dir,/r/.git,commit]", [RUN_TOOL, { argv: ["/usr/bin/git", "--no-pager", "--git-dir", "/r/.git", "commit"] }], true, "ok"],
+  ["argv [git,-c,'a=b;c',commit]", [RUN_TOOL, { argv: ["git", "-c", "a=b;c", "commit"] }], true, "ok"],
+  ["argv [git,-C,'a (b)',commit]", [RUN_TOOL, { argv: ["git", "-C", "a (b)", "commit"] }], true, "ok"],
+  ["argv [git,-C,'$(pwd)',commit] (literal value)", [RUN_TOOL, { argv: ["git", "-C", "$(pwd)", "commit"] }], true, "ok"],
+  ["argv [git,commit,-m,'a; (b)']", [RUN_TOOL, { argv: ["git", "commit", "-m", "a; (b)"] }], true, "ok"],
+  ["argv [sh,-c,'git -C /r commit -m x']", [RUN_TOOL, { argv: ["sh", "-c", "git -C /r commit -m x"] }], true, "ok"],
+  ["argv [sh,-c,'cd /x && git -C y commit -am ...']", [RUN_TOOL, { argv: ["sh", "-c", "cd /x && git -C y commit -am 'a b'"] }], true, "ok"],
+  ["argv [bash,-lc,'cd r && git commit']", [RUN_TOOL, { argv: ["bash", "-lc", "cd r && git commit -m x"] }], true, "ok"],
+  ["argv [ssh,h,'cd r; git commit -m x']", [RUN_TOOL, { argv: ["ssh", "h", "cd r; git commit -m x"] }], true, "ok"],
+  ["run_batch commands[].argv git -C commit", ["mcp__plugin_skyline-claude_skyline__run_batch", { commands: [{ argv: ["git", "-C", "/r", "commit", "-m", "x"] }] }], true, "ok"],
+  ["run_batch commands nested sh -c", ["mcp__plugin_skyline-claude_skyline__run_batch", { commands: [{ argv: ["sh", "-c", "git -C /r commit -m x"] }] }], true, "ok"],
+  ["run_job argv git commit", ["mcp__plugin_skyline-claude_skyline__run_job", { argv: ["git", "commit", "-m", "x"] }], true, "ok"],
+  ["skyline git_commit tool (any subcommand)", ["mcp__skyline__git_commit", { subcommand: "add" }], true, "ok"],
+  ["plugin git_commit tool", ["mcp__plugin_skyline-claude_skyline__git_commit", { subcommand: "commit", args: ["-m", "x"] }], true, "ok"],
+  ["1 MB fenced Write with a real git commit inside", WRITE(FENCE_1MB + "```\ngit commit -m x\n```\n"), true, "ok"],
+  // --- real commits, NOT matched (documented misses)
+  ["git --git-dir=a\\ b commit (escaped space)", BASH("git --git-dir=a\\ b commit -m m"), false, "known miss"],
+  ["git -C a\\ b commit (escaped space)", BASH("git -C a\\ b commit -m m"), false, "known miss"],
+  ["git -C $(pwd) commit (unquoted $() value)", BASH("git -C $(pwd) commit -m m"), false, "known miss"],
+  ["git -c x=$(echo y) commit (unquoted $() value)", BASH("git -c x=$(echo y) commit -m m"), false, "known miss"],
+  ["git \\<newline> commit (line continuation)", BASH("git \\\n  commit -m x"), false, "known miss"],
+  ["git -C r \\<newline> commit (continuation after option)", BASH("git -C r \\\n  commit -m x"), false, "known miss"],
+  ["git -c alias.x=commit x (alias of commit)", BASH("git -c alias.x=commit x -m m"), false, "known miss"],
+  // --- not commits, not matched
+  ["git log --grep commit", BASH("git log --grep commit"), false, "ok"],
+  ["git commit-graph write", BASH("git commit-graph write"), false, "ok"],
+  ["argv [git,log,--grep,commit]", [RUN_TOOL, { argv: ["git", "log", "--grep", "commit"] }], false, "ok"],
+  ["argv [git,-C,commit,status] (dir named commit)", [RUN_TOOL, { argv: ["git", "-C", "commit", "status"] }], false, "ok"],
+  ["argv [git,status]", [RUN_TOOL, { argv: ["git", "status"] }], false, "ok"],
+  ["git -C commit status", BASH("git -C commit status"), false, "ok"],
+  ["git help commit", BASH("git help commit"), false, "ok"],
+  ["git show commit", BASH("git show commit"), false, "ok"],
+  ["git log; echo commit", BASH("git log; echo commit"), false, "ok"],
+  ["git status | grep commit", BASH("git status | grep commit"), false, "ok"],
+  ["git status && echo commit", BASH("git status && echo commit"), false, "ok"],
+  ["git -C <(x) commit (nonsense)", BASH("git -C <(x) commit"), false, "ok"],
+  ["echo committed", BASH("echo committed"), false, "ok"],
+  ["gh pr merge 62", BASH("gh pr merge 62 --squash"), false, "ok"],
+  ["prose: use git (commit early)", WRITE("use git (commit early)"), false, "ok"],
+  ["prose: configure git\\ncommit hooks", WRITE("configure git\ncommit hooks are optional"), false, "ok"],
+  ["prose: pass git -C\\ncommit message (separator is no option value, bounce 2 finding 3)", WRITE("pass git -C\ncommit message"), false, "ok"],
+  ["prose: use git -C (commit early) (bounce 2 finding 3)", WRITE("use git -C (commit early)"), false, "ok"],
+  ["prose: Run `git` then `commit` the change", WRITE("Run `git` then `commit` the change"), false, "ok"],
+  ["prose: Run `git` `commit` (adjacent backtick spans)", WRITE("Run `git` `commit`"), false, "ok"],
+  ["prose: the `git` commit graph", WRITE("the `git` commit graph"), false, "ok"],
+  ["1 MB fenced Write, no commit (must not throw)", WRITE("# doc\n" + FENCE_1MB), false, "ok"],
+  ["many small backtick spans, 1 MB", WRITE("a `b c` commit d\n".repeat(60000)), false, "ok"],
+  // --- not commits, matched (documented false positives; 2b1eef9 matched them too)
+  ['echo "git commit" (accepted by ruling, as on 2b1eef9)', BASH('echo "git commit"'), true, "known FP"],
+  ["grep -r 'git commit' docs/", BASH("grep -r 'git commit' docs/"), true, "known FP"],
+  ["heredoc prose mentioning git commit", BASH("cat > notes.md <<'EOF'\nrun git commit after review\nEOF"), true, "known FP"],
+  ["argv [rg,'git commit',docs]", [RUN_TOOL, { argv: ["rg", "git commit", "docs"] }], true, "known FP"],
+  ["prose: Run `git commit` after review", WRITE("Run `git commit` after review"), true, "known FP"],
+  ["prose: never git commit --no-verify", WRITE("never git commit --no-verify"), true, "known FP"],
+  ["Edit new_string: then git commit the slice", ["Edit", { file_path: "/a.md", old_string: "a", new_string: "then git commit the slice" }], true, "known FP"],
+];
+
+test("commit matcher contract: isCommitCall returns the table's value for every row (any new shape goes into this table)", () => {
+  const { isCommitCall } = require("./skyline-loop-gate");
+  const statuses = new Set(["ok", "known miss", "known FP"]);
+  const wrong = [];
+  for (const [label, [tool, input], matches, status] of COMMIT_MATCHER_TABLE) {
+    assert.ok(statuses.has(status), `${label}: status ${status}`);
+    assert.equal(status === "known miss" ? !matches : status === "known FP" ? matches : true, true, `${label}: status/value mismatch`);
+    let got;
+    try {
+      got = isCommitCall(tool, input);
+    } catch (e) {
+      got = `THROW ${e && e.name}`;
+    }
+    if (got !== matches) wrong.push(`${label}: expected ${matches}, got ${got}`);
+  }
+  assert.deepEqual(wrong, []);
+  assert.ok(COMMIT_MATCHER_TABLE.length >= 90, `${COMMIT_MATCHER_TABLE.length} rows`);
+});
+
+test("commit matcher: linear on `git` tokens in option-value position (bounce 2 finding 2): 200 KB, bare and inside sh -c, each under 1 s", () => {
+  const { isCommitCall } = require("./skyline-loop-gate");
+  const K = 200 * 1024;
+  const quadratic = "-c git ".repeat(Math.ceil(K / 7)).slice(0, K) + " status commit";
+  for (const [label, command] of [
+    ["bare", quadratic],
+    ["inside sh -c '...'", `sh -c '${quadratic}'`],
+  ]) {
+    const t0 = process.hrtime.bigint();
+    const got = isCommitCall("Bash", { command });
+    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+    assert.equal(got, false, label);
+    assert.ok(ms < 1000, `${label}: ${ms.toFixed(0)} ms`);
+  }
+});
+
+test("M5 (2): a `git -c k=v commit` argv arms the Stop gate and `git -C dir commit` the commit reminder; commit-graph does not", (t) => {
+  const fx = reportFixture(t, "m5-2", [
+    assistantSkillInvoke("feature-loop-skill"),
+    toolUse("mcp__skyline__run", { argv: ["git", "-c", "user.email=a@b", "-c", "user.name=x", "commit", "-m", "slice"] }),
+  ]);
+  assert.equal(fx.stop().code, 2);
+  const res = runHook(
+    "commit",
+    { transcript_path: fx.transcript, session_id: fx.sid, tool_name: "mcp__skyline__run", tool_input: { argv: ["git", "-C", "/repo", "commit", "-m", "s"] } },
+    { SKYLINE_LOOP_REPORT_DIR: fx.dir }
+  );
+  assert.match(JSON.parse(res.out).hookSpecificOutput.additionalContext, /ADVISOR GATE/);
+  const neg = reportFixture(t, "m5-2n", [
+    assistantSkillInvoke("feature-loop-skill"),
+    toolUse("mcp__skyline__run", { argv: ["git", "commit-graph", "write"] }),
+    toolUse("Bash", { command: "git log --grep commit" }),
+  ]);
+  assert.equal(neg.stop().code, 0);
+});
+
+test("M8: a last_assistant_message carrying every FINAL field passes when the transcript lacks it (both modes); a partial one blocks", (t) => {
+  const fx = reportFixture(t, "m8", [assistantSkillInvoke("feature-loop-skill"), assistantGitCommit(), assistantText("working")]);
+  for (const mode of ["chat", undefined]) {
+    const r = fx.stop({ SKYLINE_LOOP_REPORT: mode }, undefined, undefined, { last_assistant_message: FINAL_ATTESTATION_TEXT });
+    assert.equal(r.code, 0, `mode ${mode}: ${r.err}`);
+  }
+  const r = fx.stop(undefined, undefined, undefined, { last_assistant_message: "slices shipped: 1 (abc)\nall done" });
+  assert.equal(r.code, 2);
+});
+
+// --- 1.5.38 bounce 1: unscoped inherited sessions, /branch, counter name cap
+
+test("Minor 2: a fork whose parent cannot be read keeps the 1.5.37 budget: 3 turns x 3 Stops = 2 blocks; a scoped fork's own build keeps the per-turn budget", (t) => {
+  const fx = forkFixture(t, "b1m2", { parent: false });
+  const codes = [];
+  for (const p of ["t1", "t2", "t3"]) for (let k = 0; k < 3; k += 1) codes.push(turnStop(fx, p).code);
+  assert.deepEqual(codes, [2, 2, 0, 0, 0, 0, 0, 0, 0], "session-wide, never reset (1.5.37: 2 blocks per session)");
+  assert.equal(fs.readFileSync(counterFile(fx.sid), "utf8"), "9");
+  const scoped = forkFixture(t, "b1m2s", {
+    ownEntries: [...assistantSkillInvoke("feature-loop-skill").split("\n"), assistantGitCommit(), assistantText("slice 1 done")],
+  });
+  assert.deepEqual([turnStop(scoped, "t1"), turnStop(scoped, "t1"), turnStop(scoped, "t1"), turnStop(scoped, "t2")].map((r) => r.code), [2, 2, 0, 2]);
+});
+
+// /branch, reconstructed from the Claude Code 2.1.332 bundle (bounce 1
+// Minor 3; not verified live): copied entries keep their uuid and carry
+// forkedFrom {sessionId: <parent>, messageUuid}; a via:"branch" marker comes
+// AFTER the copies, and only when data flow is on.
+function branchFixture(t, tag, { marker = true, parent = true, ownBuild = false } = {}) {
+  const fx = reportFixture(t, tag, []);
+  const pid = `${fx.sid}-parent`;
+  const parentReport = path.join(fx.dir, `${pid}.md`);
+  const parentEntries = [
+    ...assistantSkillInvoke("feature-loop-skill").split("\n"),
+    assistantGitCommit(),
+    ...liveWrites(parentReport),
+    finalCreate(parentReport),
+    assistantText(`FINAL stored: ${parentReport}`),
+  ];
+  const uuid = (i) => `${pid}-u${i}`;
+  if (parent) fs.writeFileSync(path.join(fx.tmp, `${pid}.jsonl`), parentEntries.map((l, i) => withUuid(l, uuid(i), pid)).join("\n") + "\n");
+  const copies = parentEntries.map((l, i) => JSON.stringify({ ...JSON.parse(withUuid(l, uuid(i), fx.sid)), forkedFrom: { sessionId: pid, messageUuid: uuid(i) } }));
+  const own = [
+    line({ type: "user", message: { content: "Reply with exactly: ok" } }),
+    ...(ownBuild ? [...assistantSkillInvoke("feature-loop-skill").split("\n"), assistantGitCommit()] : []),
+    assistantText("ok"),
+  ].map((l, i) => withUuid(l, `${fx.sid}-own${i}`, fx.sid));
+  const mark = marker ? [line({ type: "derived-from", v: 1, sessionId: fx.sid, sessions: [{ type: "claude_code_session", id: pid, via: "branch" }] })] : [];
+  fs.writeFileSync(fx.transcript, [...copies, ...mark, ...own].join("\n") + "\n");
+  return fx;
+}
+
+test("Minor 3: /branch shapes (marker + parent, no marker, marker + parent missing) owe no FINAL; the branch's own build is gated", (t) => {
+  for (const [label, opts] of [
+    ["marker via=branch, parent present", {}],
+    ["no marker (data flow off), parent present", { marker: false }],
+    ["marker, parent missing", { parent: false }],
+  ]) {
+    const fx = branchFixture(t, `b1m3-${label.length}`, opts);
+    const r = fx.stop();
+    assert.equal(r.code, 0, `${label}: ${r.err}`);
+  }
+  const own = branchFixture(t, "b1m3-own", { ownBuild: true });
+  const r = own.stop();
+  assert.equal(r.code, 2, "negative control: the branch's own Skill + commit with no FINAL");
+  assert.ok(r.err.includes(own.report), "names the branch's own report path");
+});
+
+test("nit 6: a 200-char session id and prompt_id still give a usable counter name (hashed turn part); the gate blocks instead of failing open", (t) => {
+  const raw = "s".repeat(200);
+  const fx = reportFixture(t, "b1n6", [assistantSkillInvoke("feature-loop-skill"), assistantGitCommit()]);
+  fx.track(sidName(raw));
+  const r = fx.stop({ SKYLINE_LOOP_REPORT: "chat" }, raw, undefined, { prompt_id: "p".repeat(200) });
+  assert.equal(r.code, 2, "1.5.38 before the cap: ENAMETOOLONG => exit 0 from the first Stop");
+  const names = fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith(`skyline-loop-gate-${sidName(raw)}@`));
+  assert.equal(names.length, 1, names.join(","));
+  assert.match(names[0], /@~[0-9a-f]{16}$/);
+  assert.ok(names[0].length <= 200, `${names[0].length} chars`);
+});
+
+// --- bounce 2 finding 1: fork chains. Markers list every ancestor, oldest
+// first, the immediate parent last (live fork-of-fork). Only the immediate
+// parent covers the whole inherited history; when it is neither read nor
+// named by the stamps the session is unscoped (1.5.37 budget). Shapes from
+// the round-2 review's u3chain.js: A = grandparent (Q&A), B = immediate parent
+// (inherits A, then builds: Skill + commit, no FINAL), C = this session.
+function chainFixture(t, tag, build) {
+  const fx = reportFixture(t, tag, []);
+  const A = `${fx.sid}-A`;
+  const B = `${fx.sid}-B`;
+  const ent = (type, uuid, content, x = {}) => JSON.stringify({ type, uuid, ...x, message: { role: type, content } });
+  const stamp = (from) => ({ forkedFrom: { sessionId: from, messageUuid: "m" } });
+  const skill = (u, x) => ent("assistant", u, [{ type: "tool_use", name: "Skill", input: { skill: "skyline-claude:feature-loop-skill" } }], x);
+  const commit = (u, x) => ent("assistant", u, [{ type: "tool_use", name: "Bash", input: { command: "git commit -m x" } }], x);
+  const df = (list) => line({ type: "derived-from", v: 1, sessions: list.map(([id, via]) => ({ type: "claude_code_session", id, via })) });
+  const aEntries = (x) => [ent("user", "a0", "hi", x), ent("assistant", "a1", [{ type: "text", text: "hello" }], x)];
+  const bOwn = (x) => [ent("user", "b0", "build", x), skill("b1", x), commit("b2", x)];
+  const cOwnQA = [ent("user", "c0", "Reply ok"), ent("assistant", "c1", [{ type: "text", text: "ok" }])];
+  const cOwnBuild = [ent("user", "c0", "go"), skill("c1"), commit("c2")];
+  const { lines, files } = build({ A, B, df, stamp, aEntries, bOwn, cOwnQA, cOwnBuild });
+  fs.writeFileSync(fx.transcript, lines.join("\n") + "\n");
+  for (const [id, ls] of Object.entries(files)) fs.writeFileSync(path.join(fx.tmp, `${id}.jsonl`), ls.join("\n") + "\n");
+  return fx;
+}
+
+function threeTurns(fx) {
+  const codes = [];
+  for (const p of ["t1", "t2", "t3"]) for (let k = 0; k < 3; k += 1) codes.push(turnStop(fx, p).code);
+  return codes;
+}
+
+test("bounce 2 finding 1: a chain whose immediate parent is gone is unscoped (2 blocks over 3 turns), never scoped by an older ancestor", (t) => {
+  const shapes = [
+    ["chain [A/fork, B/fork], A present, B missing", (s) => ({ lines: [s.df([[s.A, "fork"], [s.B, "fork"]]), ...s.aEntries(), ...s.bOwn(), ...s.cOwnQA], files: { [s.A]: s.aEntries() } })],
+    ["H' [A/branch, B/fork], stamps name A, A and B missing", (s) => ({ lines: [s.df([[s.A, "branch"], [s.B, "fork"]]), ...s.aEntries(s.stamp(s.A)), ...s.bOwn(), ...s.cOwnQA], files: {} })],
+  ];
+  for (const [label, build] of shapes) {
+    const fx = chainFixture(t, `b2f1-${label.length}`, build);
+    const codes = threeTurns(fx);
+    assert.deepEqual(codes, [2, 2, 0, 0, 0, 0, 0, 0, 0], `${label} (980460e: 2,2,0 per turn = 6 blocks)`);
+  }
+});
+
+test("bounce 2 finding 1 controls: branch of branch, chain with B present, fork of a branch with B present owe nothing; C's own build stays gated per turn", (t) => {
+  const zero = [
+    ["branch of branch, stamps name B, A and B missing", (s) => ({ lines: [...s.aEntries(s.stamp(s.B)), ...s.bOwn(s.stamp(s.B)), s.df([[s.A, "branch"], [s.B, "branch"]]), ...s.cOwnQA], files: {} })],
+    ["chain [A/fork, B/fork], A missing, B present", (s) => ({ lines: [s.df([[s.A, "fork"], [s.B, "fork"]]), ...s.aEntries(), ...s.bOwn(), ...s.cOwnQA], files: { [s.B]: [...s.aEntries(), ...s.bOwn()] } })],
+    ["fork of a branch [A/branch, B/fork], B present", (s) => ({ lines: [s.df([[s.A, "branch"], [s.B, "fork"]]), ...s.aEntries(s.stamp(s.A)), ...s.bOwn(), ...s.cOwnQA], files: { [s.B]: [...s.aEntries(s.stamp(s.A)), ...s.bOwn()] } })],
+  ];
+  for (const [label, build] of zero) {
+    const fx = chainFixture(t, `b2c-${label.length}`, build);
+    assert.deepEqual(threeTurns(fx), [0, 0, 0, 0, 0, 0, 0, 0, 0], label);
+  }
+  const own = chainFixture(t, "b2c-own", (s) => ({
+    lines: [s.df([[s.A, "fork"], [s.B, "fork"]]), ...s.aEntries(), ...s.bOwn(), ...s.cOwnBuild],
+    files: { [s.B]: [...s.aEntries(), ...s.bOwn()] },
+  }));
+  assert.deepEqual(threeTurns(own), [2, 2, 0, 2, 2, 0, 2, 2, 0], "C's own build: scoped, per-turn budget");
 });

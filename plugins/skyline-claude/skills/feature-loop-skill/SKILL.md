@@ -56,6 +56,7 @@ FINAL (all fields MANDATORY, no omissions):
   ├─ file, one per line: `# feature-loop FINAL` → `loop-report: v1` → (the live CHECKPOINT lines) → `repo: <abs root>` → `branch: <name>` → `date: <UTC ISO>` → the five fields above, labels verbatim (gate matches them) → `skylore: <nothing durable | marked <ids>>` at column 0, no tree glyph
   ├─ chat = ONLY `FINAL stored: <path>` + ≤2 short lines (what shipped + suite status; deviations count)
   ├─ create fails ⇒ print FINAL in chat (gate accepts either)
+  ├─ pausing mid-build (question to the user, turn ends before the last slice) ⇒ write an interim FINAL (slices so far); keep appending CHECKPOINT lines and rewrite the FINAL when done
   ├─ no path given (primer and gate absent, `SKYLINE_LOOP_REPORT=chat`, another harness) ⇒ CHECKPOINT lines and FINAL in chat as before
   └─ dispatch brief names a destination (board comment, PR body) ⇒ post there as well; in file mode still append the CHECKPOINT lines to the FINAL file and write the FINAL there (the Stop gate reads it)
 
